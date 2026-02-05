@@ -1,0 +1,19 @@
+# Environment Variables
+.env
+
+# Google Cloud Credentials
+credentials.json
+token.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs
+*.log
+log.txt
+log_debug.txt
+
+# Artifacts/Debug
+last_response.json
