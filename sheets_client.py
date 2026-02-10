@@ -68,6 +68,17 @@ class SheetsClient:
             self.sheet.append_row(headers)
             print("Created new sheet with headers.")
 
+    def clear_sheet(self):
+        """Clears the sheet and re-adds headers."""
+        print("Clearing entire sheet...")
+        self.sheet.clear()
+        headers = [
+            "KSeF ID", "Invoice Number", "Seller NIP", "Seller Name", 
+            "Issue Date", "Net Amount", "Gross Amount", "Currency"
+        ]
+        self.sheet.append_row(headers)
+        print("Sheet cleared and headers re-added.")
+
     def get_existing_ids(self):
         """Fetches all KSeF IDs from Column A to avoid duplicates."""
         # Assuming KSeF ID is in Column 1 (A)

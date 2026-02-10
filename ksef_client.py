@@ -83,6 +83,53 @@ class KsefClient:
         )
         return base64.b64encode(encrypted).decode('utf-8')
 
+    def _redeem_token(self, initial_token):
+        """
+        Redeems the initial token for an access token.
+        Handles 480 and 100 statuses with exponential backoff.
+        """
+        redeem_url = f"{self.base_url}/auth/token/redeem"
+        # n8n sends headers only. Content-Length: 0 might be needed or handled by requests.
+        headers = {
+            "Authorization": f"Bearer {initial_token}",
+            "Accept": "application/json"
+        }
+        
+        max_attempts = 5
+        
+        for attempt in range(1, max_attempts + 1):
+            # print(f"Redeem Attempt {attempt}/{max_attempts}...")
+            
+            try:
+                # requests.post without data/json sets Content-Length: 0
+                response = requests.post(redeem_url, headers=headers)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    return data['accessToken']['token']
+                
+                elif response.status_code in [480, 100]:
+                    wait_time = 10 * attempt
+                    print(f"Status {response.status_code}. Waiting {wait_time}s before retry...")
+                    time.sleep(wait_time)
+                    continue
+                
+                else:
+                     # print(f"Redeem Failed with Status {response.status_code}: {response.text}")
+                     response.raise_for_status()
+            
+            except requests.exceptions.HTTPError as e:
+                # Double check status in exception if raise_for_status wasn't called above for handled codes
+                if e.response.status_code in [480, 100]: # Should be handled in elif, but just in case
+                     wait_time = 10 * attempt
+                     print(f"Status {e.response.status_code}. Waiting {wait_time}s before retry...")
+                     time.sleep(wait_time)
+                     continue
+                else:
+                    raise e
+                    
+        raise Exception("Max retries reached for Token Redemption.")
+
     def authenticate(self):
         """Full authentication flow to get Session Token."""
         print("Starting KSeF Authentication...")
@@ -176,123 +223,164 @@ class KsefClient:
         if not self.session_token:
             raise Exception("Failed to retrieve initial token from InitToken response")
 
-        print(f"Initial Token received. Waiting for processing before Redeem...")
-        time.sleep(5) # Wait for session validation (Status 100 -> Active)
+        # 5. Redeem Token (Mandatory)
+        print("Redeeming Initial Token...")
+        self.access_token = self._redeem_token(self.session_token)
+        
+        if not self.access_token:
+             raise Exception("Failed to redeem token.")
 
-        # 5. Redeem Token
-        # Endpoint: /auth/token/redeem
-        # Header: Authorization: Bearer [InitialToken]
-        
-        redeem_headers = {
-            "Authorization": f"Bearer {self.session_token}",
-            "Accept": "application/json"
-        }
-        
-        # Retry loop for redemption
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                redeem_resp = self._post("/auth/token/redeem", {}, headers=redeem_headers)
-                break # Success
-            except requests.exceptions.HTTPError as e:
-                print(f"Redeem Attempt {attempt+1} Failed: {e}")
-                if e.response.status_code == 400 and "21301" in e.response.text:
-                    print("Session not ready (Status 100?). Waiting...")
-                    time.sleep(5)
-                else:
-                    raise e
-        else:
-            raise Exception("Failed to redeem token after retries.")
-        
-        if 'accessToken' in redeem_resp:
-            # accessToken might be a dict containing 'token'
-            if isinstance(redeem_resp['accessToken'], dict):
-                 self.access_token = redeem_resp['accessToken'].get('token')
-            else:
-                 self.access_token = redeem_resp['accessToken']
-        elif 'token' in redeem_resp:
-             self.access_token = redeem_resp['token']
-        elif 'authenticationToken' in redeem_resp:
-             # Fallback
-             self.access_token = redeem_resp['authenticationToken'].get('token')
-        else:
-            print(f"DEBUG: Redeem Response: {redeem_resp}")
-            raise Exception("Failed to retrieve Access Token from Redeem response")
-            
-        # Update headers with Final Bearer Token for subsequent calls
+        # 6. Set Authorization Header for future requests
         self.headers["Authorization"] = f"Bearer {self.access_token}"
-        # Remove SessionToken if it was set (v1 legacy)
+        
+        # Remove SessionToken if it was set (though we didn't set it in self.headers yet in this flow)
         if "SessionToken" in self.headers:
             del self.headers["SessionToken"]
             
-        print(f"Token Redeemed! Access Token: {self.access_token[:10]}...")
+        print(f"Token Authenticated & Redeemed! Access Token: {self.access_token[:10]}...")
 
-    def get_invoices(self, start_date_iso):
-        """
-        Fetches invoice headers using /invoices/query/metadata (n8n style).
-        """
-        if not hasattr(self, 'access_token') or not self.access_token:
-            # Fallback if only session_token exists?
-             pass 
 
-        # Override start date to match n8n for testing
-        start_date_iso = "2025-10-01T00:00:00+00:00"
+    def get_invoices(self, start_date_iso, end_date_iso=None, page_size=1000):
+        """
+        Fetches invoice headers using /online/Query/Invoice/Sync with pagination.
+        Loops until all invoices are downloaded.
         
-        # Calculate End Date (Limit to 1 month to avoid 3-month limit error)
-        # Using a fixed end date for this test to match n8n's likely first batch
-        # or just adding 30 days.
-        start_dt = datetime.fromisoformat(start_date_iso)
-        end_dt = start_dt.replace(month=start_dt.month + 1) # simple logic for Oct->Nov
-        end_date_iso = end_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        Args:
+            start_date_iso (str): Start date in ISO format.
+            end_date_iso (str): End date in ISO format.
+            page_size (int): Number of invoices per page (default 1000).
+        """
+        # Parse Dates
+        try:
+             start_dt = datetime.fromisoformat(start_date_iso.replace('Z', '+00:00'))
+        except ValueError:
+             start_dt = datetime.fromisoformat(start_date_iso)
+             
+        if not end_date_iso:
+            end_dt = start_dt.replace(month=start_dt.month + 1)
+            end_date_iso = end_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
         
         print(f"Querying invoices from {start_date_iso} to {end_date_iso}...")
         
-        # Helper logs
         if "Authorization" not in self.headers:
-             print("WARNING: Authorization header missing!")
-
-        # Payload structure from n8n (Subject1 = Sales)
-        payload = {
-            "subjectType": "subject1",
-            "dateRange": {
-                "dateType": "Invoicing", 
-                "from": start_date_iso,
-                "to": end_date_iso
-            }
-        }
-        
-        # n8n adds pageSize as query param. _post takes endpoint.
-        # base_url has /v2
-        query_url = "/invoices/query/metadata?pageSize=100&pageOffset=0"
-        
-        print(f"DEBUG: Posting to {query_url} with payload: {payload}")
-        try:
-            resp = self._post(query_url, payload)
-        except requests.exceptions.HTTPError as e:
-            print(f"Query Failed: {e}")
-            print(f"Response: {e.response.text}")
-            raise e
-            
-        # Print RAW response for debugging
-        print(f"DEBUG: RAW Query Response: {json.dumps(resp, indent=2)}")
+             print("WARNING: Auth header missing!")
 
         all_invoices = []
-        # n8n output structure parsing
-        # Usually list is under invoiceHeaderList or similar
-        if 'invoiceHeaderList' in resp:
-            all_invoices = resp['invoiceHeaderList']
-        elif 'invoiceMetadataList' in resp:
-            all_invoices = resp['invoiceMetadataList']
-        else:
-             # Logic to find the list key dynamically
-             print(f"DEBUG: Response Keys: {list(resp.keys())}")
-             for key, value in resp.items():
-                 if isinstance(value, list) and len(value) > 0:
-                     print(f"DEBUG: Found list in key: '{key}'")
-                     all_invoices = value
-                     break
+        page_offset = 0
         
-        print(f"Total invoices found: {len(all_invoices)}")
+        while True:
+            # 1. Mandatory Throttling
+            time.sleep(1.0)
+            
+            # 2. 10k Limit Safeguard
+            # If we are about to fetch beyond 10k invoices (offset 10 * 1000 = 10000)
+            # KSeF allows max 10,000 results per query.
+            # Page offsets are 0-indexed. 
+            # If page_size is 1000, max offset is 9.
+            # If page_size is 100, max offset is 99.
+            # Logic: (page_offset + 1) * page_size > 10000 -> Stop?
+            # User req: "stop at pageOffset ~9900" (assuming size 100).
+            # With size 1000, safe stop is offset >= 9.
+            
+            # Generalized check:
+            if (page_offset * page_size) >= 9900:
+                print(f"WARNING: Reached 10k invoice limit for this chunk (Offset {page_offset}). Stopping to avoid blocking.")
+                print("DATA MAY BE INCOMPLETE for this date range. Shrink chunk size if frequent.")
+                break
+            
+            print(f"Fetching Page (Offset: {page_offset}, Size: {page_size})...")
+            
+            payload = {
+                "subjectType": "subject2", # Strictly Purchases
+                "dateRange": {
+                    "dateType": "Invoicing", 
+                    "from": start_date_iso,
+                    "to": end_date_iso
+                }
+            }
+            
+            # Endpoint with pagination
+            query_url = f"/invoices/query/metadata?pageSize={page_size}&pageOffset={page_offset}"
+            url = f"{self.base_url}{query_url}"
+            
+            # 3. Robust 429 Handling
+            while True:
+                try:
+                    response = requests.post(url, json=payload, headers=self.headers)
+                    if response.status_code == 429:
+                        print(f"Rate Limit Hit (429). Parsing wait time...")
+                        try:
+                            # Try parsing "details": ["... 1777 sekund ..."]
+                            resp_json = response.json()
+                            details = resp_json.get('status', {}).get('details', [])
+                            wait_seconds = 60 # Default fallback
+                            
+                            # Simple regex or string search for digits in details
+                            import re
+                            # Combine details into one string
+                            detail_str = " ".join(details) if isinstance(details, list) else str(details)
+                            
+                            # Look for digits
+                            matches = re.findall(r'(\d+)', detail_str)
+                            if matches:
+                                # Start with largest number found? Or specific context?
+                                # Usually "po X sekundach". Let's assume largest is safest or last one.
+                                # "po 1777 sekundach" -> 1777
+                                wait_seconds = int(matches[-1]) # often the last number is the seconds
+                            
+                            print(f"Waiting {wait_seconds} + 2 seconds...")
+                            time.sleep(wait_seconds + 2)
+                            continue # Retry request
+                            
+                        except Exception as parse_err:
+                            print(f"Failed to parse 429 details: {parse_err}. Sleeping 60s.")
+                            time.sleep(60)
+                            continue
+                            
+                    response.raise_for_status()
+                    resp_json = response.json()
+                    break # Success, exit retry loop
+                    
+                except requests.exceptions.HTTPError as e:
+                    print(f"Query Failed: {e}")
+                    # If it was a hard error other than 429 (handled above), raise it.
+                    if e.response.status_code != 429:
+                        print(f"Response: {e.response.text}")
+                        raise e
+                    # If it somehow was 429 caught here (should be handled by status check logic), retry?
+                    # The explicit status check above handles 429 without raising exception first.
+                    # So this block handles 400, 401, 500 etc.
+            
+            # Extract Invoices
+            current_batch = []
+            if 'invoiceHeaderList' in resp_json:
+                current_batch = resp_json['invoiceHeaderList']
+            elif 'invoiceMetadataList' in resp_json:
+                current_batch = resp_json['invoiceMetadataList']
+            else:
+                 # Check for generic list locators if schema changes
+                 for key, value in resp_json.items():
+                     if isinstance(value, list) and len(value) > 0:
+                         current_batch = value
+                         break
+            
+            if not current_batch:
+                print("No more invoices found in this page.")
+                break
+                
+            count = len(current_batch)
+            print(f"Downloaded {count} invoices from this page.")
+            all_invoices.extend(current_batch)
+            
+            # Check pagination
+            if count < page_size:
+                print("Reached end of list.")
+                break
+                
+            # Prepare next page
+            page_offset += 1 
+            
+        print(f"Total invoices found (All Pages): {len(all_invoices)}")
         return all_invoices
 
     def get_invoice_xml(self, ksef_reference_number):
