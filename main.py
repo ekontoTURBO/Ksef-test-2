@@ -19,11 +19,38 @@ from ksef_client import KsefClient
 from sheets_client import SheetsClient
 
 # Load env variables
+# Load env variables
 load_dotenv()
 
-KSEF_URL = "https://api-test.ksef.mf.gov.pl/v2/"
-KSEF_NIP = os.getenv("KSEF_NIP")
-KSEF_TOKEN = os.getenv("KSEF_TOKEN")
+KSEF_ENV = os.getenv("KSEF_ENV", "TEST").upper()
+
+# Environment Configurations
+ENV_CONFIG = {
+    "TEST": {
+        "URL": "https://api-test.ksef.mf.gov.pl/v2/",
+        "NIP": os.getenv("KSEF_NIP"),
+        "TOKEN": os.getenv("KSEF_TOKEN")
+    },
+    "DEMO": {
+        "URL": "https://api-demo.ksef.mf.gov.pl/v2/",
+        "NIP": os.getenv("KSEF_NIP"), # Usually same as Test but can be different
+        "TOKEN": os.getenv("KSEF_TOKEN")
+    },
+    "PROD": {
+        "URL": "https://api.ksef.mf.gov.pl/v2/",
+        "NIP": os.getenv("KSEF_PROD_NIP"),
+        "TOKEN": os.getenv("KSEF_PROD_TOKEN")
+    }
+}
+
+if KSEF_ENV not in ENV_CONFIG:
+    print(f"Error: Invalid KSEF_ENV '{KSEF_ENV}'. Must be TEST, DEMO, or PROD.")
+    sys.exit(1)
+
+CURRENT_CONFIG = ENV_CONFIG[KSEF_ENV]
+KSEF_URL = CURRENT_CONFIG["URL"]
+KSEF_NIP = CURRENT_CONFIG["NIP"]
+KSEF_TOKEN = CURRENT_CONFIG["TOKEN"]
 SHEET_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
 SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "KSeF Invoices Sync")
 PROGRESS_FILE = "progress.txt"
@@ -46,45 +73,73 @@ def fetch_invoices_reverse_chunks(ksef, start_date, end_date, chunk_days=30):
     Saves progress after each chunk.
     """
     all_invoices = []
-    current_end = end_date
     
-    # We loop until current_end is back at (or before) start_date
-    while current_end > start_date:
-        current_start = current_end - timedelta(days=chunk_days)
-        if current_start < start_date:
-            current_start = start_date
+    # "Current Pointer" tracks the strict end of the current chunk window.
+    # We move this back by chunk_days exactly every iteration.
+    current_pointer = end_date
+    
+    empty_chunk_streak = 0
+    
+    # We loop until current_pointer is back at (or before) start_date
+    while current_pointer > start_date:
+        # 1. Define Strict Window
+        chunk_start = current_pointer - timedelta(days=chunk_days)
+        if chunk_start < start_date:
+            chunk_start = start_date
             
-        start_iso = current_start.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-        end_iso = current_end.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        # 2. Define Query Window (with 1 day overlap on the END side)
+        # We query from chunk_start to (current_pointer + 1 day)
+        # This catches invoices at the boundary of the previous chunk.
+        query_end = current_pointer + timedelta(days=1)
         
-        print(f"\n--- Chunk (Reverse): {start_iso} to {end_iso} ---")
+        start_iso = chunk_start.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        end_iso_query = query_end.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        
+        print(f"\n--- Chunk (Reverse): {start_iso} to {end_iso_query} ---")
         try:
-            batch = ksef.get_invoices(start_iso, end_iso, page_size=1000)
-            all_invoices.extend(batch)
+            batch = ksef.get_invoices(start_iso, end_iso_query, page_size=250)
             
-            # Save checkpoint: We successfully synced down to 'current_start'.
-            # Next run should pick up from 'current_start'.
+            if not batch:
+                 print(f"No invoices in this chunk... Moving to next period.")
+                 empty_chunk_streak += 1
+            else:
+                 all_invoices.extend(batch)
+                 empty_chunk_streak = 0 # Reset streak
+            
+            # Save checkpoint: We successfully synced down to 'chunk_start'.
             save_progress(start_iso)
             
+            # 3-Strike Empty Rule
+            if empty_chunk_streak >= 3:
+                print(f"\n[WARNING] No data found for the last {chunk_days * 3} days (3 consecutive chunks).")
+                try:
+                    choice = input("Continue searching further back? (Y/N): ").strip().upper()
+                    if choice != 'Y':
+                        print("Stopping sync by user request.")
+                        break
+                    else:
+                        empty_chunk_streak = 0 # Reset to allow another 3 chunks
+                except EOFError:
+                    break
+            
         except Exception as e:
-            print(f"ERROR fetching chunk {start_iso} - {end_iso}: {e}")
+            print(f"ERROR fetching chunk {start_iso}: {e}")
             print("Stopping sync to preserve checkpoint integrity.")
-            # We raise so main stops processing and doesn't mark things done that failed
             raise e
             
-        # Move back
-        # current_end becomes current_start (minus 1 sec if strict, but ranges usually fine)
-        # To match the "1 sec safety" from forward loop, we subtract 1 sec from new end.
-        current_end = current_start - timedelta(seconds=1)
+        # Move pointer back strictly
+        current_pointer = chunk_start
         
     return all_invoices
 
+    return all_invoices
+
 def main():
-    print("--- KSeF Robust Triple-Mode Sync Started ---")
+    print(f"--- KSeF Sync [{KSEF_ENV}] Started ---")
     
     # Validation
     if not KSEF_NIP or not KSEF_TOKEN:
-        print("Error: KSEF_NIP or KSEF_TOKEN missing in .env")
+        print(f"Error: NIP or TOKEN missing for environment {KSEF_ENV} in .env")
         sys.exit(1)
         
     if not os.path.exists(SHEET_CREDENTIALS):
@@ -100,6 +155,7 @@ def main():
     print("A: Complete History (Reverse 30-day Chunks + Checkpointing)")
     print("B: Quarterly Catch-up (Last 90 Days)")
     print("C: Weekly Pulse (Last 7 Days)")
+    print("D: Dry Run (Connection Test - No Sheet Write)")
     
     try:
         choice = input("Enter choice (A/B/C): ").strip().upper()
@@ -107,7 +163,7 @@ def main():
         print("Input error, defaulting to C (Weekly).")
         choice = 'C'
 
-    if choice not in ['A', 'B', 'C']:
+    if choice not in ['A', 'B', 'C', 'D']:
         print("Invalid choice. Exiting.")
         sys.exit(1)
 
@@ -211,9 +267,10 @@ def main():
             
         print(f"Fetching from {start_date_iso} to {end_date_iso}...")
         try:
-            # 10k Limit in Mode B check
-            # ksef_client handles the safe stop.
-            invoices = ksef.get_invoices(start_date_iso, end_date_iso, page_size=1000)
+            # Use reverse chunks even for Mode B to be safe and avoid 0001 errors or timeouts
+            # Reuse the robust function we have. 
+            # Note: fetch_invoices_reverse_chunks takes datetime objects, not strings.
+            invoices = fetch_invoices_reverse_chunks(ksef, start_date, today, chunk_days=30)
         except Exception as e:
             print(f"KSeF Query Error: {e}")
             sys.exit(1)
@@ -241,6 +298,29 @@ def main():
             print(f"KSeF Query Error: {e}")
             sys.exit(1)
 
+    elif choice == 'D':
+        print("\n--- MODE D: DRY RUN (VERIFICATION) ---")
+        # Just fetch last 7 days to test connection
+        start_date = today - timedelta(days=7)
+        start_date_iso = start_date.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        end_date_iso = today.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        
+        # Authenticate
+        try:
+            ksef.authenticate()
+        except Exception: 
+            sys.exit(1)
+            
+        print(f"Test Fetching from {start_date_iso} to {end_date_iso}...")
+        try:
+            invoices = ksef.get_invoices(start_date_iso, end_date_iso, page_size=100)
+            print(f"SUCCESS! Connection working. Found {len(invoices)} invoices.")
+            print("Skipping Sheets Sync in Dry Run mode.")
+            return # Exit main
+        except Exception as e:
+            print(f"KSeF Query Error: {e}")
+            sys.exit(1)
+
     # 7. Process & Deduplicate
     new_rows = []
     skipped_count = 0
@@ -256,6 +336,10 @@ def main():
              
         if ksef_id in existing_ids:
             skipped_count += 1
+            # Verbose Logging for Duplicates
+            # Seller Name is not parsed yet, let's peek
+            s_name = invoice.get('seller', {}).get('name') or 'N/A'
+            print(f"Skipped Duplicate: {inv_num} - {s_name}")
             continue
             
         # Parse Subject2 Fields

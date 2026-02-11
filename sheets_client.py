@@ -180,7 +180,18 @@ class SheetsClient:
             groups[key].append(row)
             
         # Sort groups keys Descending
-        sorted_keys = sorted(groups.keys(), reverse=True)
+        # Filter out invalid dates (year 0001)
+        valid_groups = {}
+        for key, val in groups.items():
+            if key[0] <= 1900: # Simple check for 0001 or insane dates
+                print(f"Warning: Found {len(val)} invoices with invalid dates (Year {key[0]}). Skipping them.")
+                # Optional: Print IDs of skipped?
+                continue
+            if not val:
+                 continue
+            valid_groups[key] = val
+            
+        sorted_keys = sorted(valid_groups.keys(), reverse=True)
 
         # 4. Construct Output
         output_rows = []
@@ -196,8 +207,12 @@ class SheetsClient:
         # We'll build the output list of lists.
         
         for (year, month) in sorted_keys:
+            # valid_groups ensure we only process months with data
+            block_invoices = valid_groups[(year, month)]
+            if not block_invoices:
+                 continue
+
             month_name = datetime.date(year, month, 1).strftime("%B %Y")
-            block_invoices = groups[(year, month)]
             
             # Calculate Sums
             total_net = sum(float(r[5]) if r[5] else 0 for r in block_invoices)

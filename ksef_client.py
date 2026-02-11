@@ -1,4 +1,5 @@
 import requests
+import sys
 import json
 import base64
 import time
@@ -36,8 +37,21 @@ class KsefClient:
             h.update(headers)
         response = requests.post(url, json=data, headers=h)
         try:
+            # Critical Safety Check for Production: 401/403 = STOP IMMEDIATELY
+            if response.status_code in [401, 403]:
+                print(f"\n[CRITICAL] Auth Failure ({response.status_code}) at {url}.")
+                print("Stopping IMMEDIATELY to protect NIP from blacklisting.")
+                print(f"Response: {response.text}")
+                # We raise a specific SystemExit or similar to ensure main loop stops
+                sys.exit(1)
+
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
+            # Double check in case raise_for_status caught it
+            if e.response.status_code in [401, 403]:
+                print(f"\n[CRITICAL] Auth Failure ({e.response.status_code}) caught in exception.")
+                sys.exit(1)
+                
             print(f"Error Posting to {url}: {response.text}")
             raise e
         return response.json()
@@ -238,9 +252,13 @@ class KsefClient:
             del self.headers["SessionToken"]
             
         print(f"Token Authenticated & Redeemed! Access Token: {self.access_token[:10]}...")
+        
+        # Safety Buffer for Production Propagation
+        print("Waiting 3 seconds for session propagation...")
+        time.sleep(3)
 
 
-    def get_invoices(self, start_date_iso, end_date_iso=None, page_size=1000):
+    def get_invoices(self, start_date_iso, end_date_iso=None, page_size=250):
         """
         Fetches invoice headers using /online/Query/Invoice/Sync with pagination.
         Loops until all invoices are downloaded.
@@ -248,8 +266,12 @@ class KsefClient:
         Args:
             start_date_iso (str): Start date in ISO format.
             end_date_iso (str): End date in ISO format.
-            page_size (int): Number of invoices per page (default 1000).
+            page_size (int): Number of invoices per page (default 250).
         """
+        # Production Limit enforcement
+        if page_size > 250:
+            print(f"Adjusting pageSize from {page_size} to 250 (Production Limit).")
+            page_size = 250
         # Parse Dates
         try:
              start_dt = datetime.fromisoformat(start_date_iso.replace('Z', '+00:00'))
@@ -303,39 +325,30 @@ class KsefClient:
             query_url = f"/invoices/query/metadata?pageSize={page_size}&pageOffset={page_offset}"
             url = f"{self.base_url}{query_url}"
             
-            # 3. Robust 429 Handling
+            # 3. Robust 429 & Initial 401/403 Handling
+            retry_auth = False
+            # We only retry for Auth once per PAGE 0 (First Query)
+            if page_offset == 0:
+                 retry_auth = True
+
             while True:
                 try:
                     response = requests.post(url, json=payload, headers=self.headers)
+                    
+                    # Special Initial Retry for 401/403 (Double Start Fix)
+                    if response.status_code in [401, 403] and retry_auth:
+                        print(f"Initial Auth Check: {response.status_code}. Retrying once in 5s...")
+                        time.sleep(5)
+                        retry_auth = False # Consume retry
+                        continue
+                        
+                        retry_auth = False # Consume retry
+                        continue
+                        
                     if response.status_code == 429:
-                        print(f"Rate Limit Hit (429). Parsing wait time...")
-                        try:
-                            # Try parsing "details": ["... 1777 sekund ..."]
-                            resp_json = response.json()
-                            details = resp_json.get('status', {}).get('details', [])
-                            wait_seconds = 60 # Default fallback
-                            
-                            # Simple regex or string search for digits in details
-                            import re
-                            # Combine details into one string
-                            detail_str = " ".join(details) if isinstance(details, list) else str(details)
-                            
-                            # Look for digits
-                            matches = re.findall(r'(\d+)', detail_str)
-                            if matches:
-                                # Start with largest number found? Or specific context?
-                                # Usually "po X sekundach". Let's assume largest is safest or last one.
-                                # "po 1777 sekundach" -> 1777
-                                wait_seconds = int(matches[-1]) # often the last number is the seconds
-                            
-                            print(f"Waiting {wait_seconds} + 2 seconds...")
-                            time.sleep(wait_seconds + 2)
-                            continue # Retry request
-                            
-                        except Exception as parse_err:
-                            print(f"Failed to parse 429 details: {parse_err}. Sleeping 60s.")
-                            time.sleep(60)
-                            continue
+                        print(f"[CRITICAL] KSeF Rate Limit Reached (429).")
+                        print("Please wait 15-30 minutes before running again.")
+                        sys.exit(1)
                             
                     response.raise_for_status()
                     resp_json = response.json()
@@ -345,11 +358,13 @@ class KsefClient:
                     print(f"Query Failed: {e}")
                     # If it was a hard error other than 429 (handled above), raise it.
                     if e.response.status_code != 429:
+                        # Check 401/403 fatal exit
+                        if e.response.status_code in [401, 403]:
+                             print("[CRITICAL] Auth Failure during Query.")
+                             sys.exit(1)
+                             
                         print(f"Response: {e.response.text}")
                         raise e
-                    # If it somehow was 429 caught here (should be handled by status check logic), retry?
-                    # The explicit status check above handles 429 without raising exception first.
-                    # So this block handles 400, 401, 500 etc.
             
             # Extract Invoices
             current_batch = []
