@@ -100,10 +100,10 @@ class KsefClient:
     def _redeem_token(self, initial_token):
         """
         Redeems the initial token for an access token.
-        Handles 480 and 100 statuses with exponential backoff.
+        Handles 400, 480, and 100 statuses with exponential backoff.
         """
+        print(f"--- parsing token redemption ---")
         redeem_url = f"{self.base_url}/auth/token/redeem"
-        # n8n sends headers only. Content-Length: 0 might be needed or handled by requests.
         headers = {
             "Authorization": f"Bearer {initial_token}",
             "Accept": "application/json"
@@ -112,36 +112,38 @@ class KsefClient:
         max_attempts = 5
         
         for attempt in range(1, max_attempts + 1):
-            # print(f"Redeem Attempt {attempt}/{max_attempts}...")
-            
             try:
                 # requests.post without data/json sets Content-Length: 0
                 response = requests.post(redeem_url, headers=headers)
                 
                 if response.status_code == 200:
                     data = response.json()
+                    print(f"[SUCCESS] Token Redeemed. Session is now active.")
+                    print(f"--- end token redemption ---")
                     return data['accessToken']['token']
                 
-                elif response.status_code in [480, 100]:
-                    wait_time = 10 * attempt
-                    print(f"Status {response.status_code}. Waiting {wait_time}s before retry...")
+                # 400: Bad Request (often session not ready), 480: Suspended, 100: Continue
+                elif response.status_code in [400, 480, 100]:
+                    wait_time = 3 * attempt # 3, 6, 9, 12, 15
+                    print(f"Status {response.status_code} (Warming Up). Waiting {wait_time}s before retry...")
                     time.sleep(wait_time)
                     continue
                 
                 else:
-                     # print(f"Redeem Failed with Status {response.status_code}: {response.text}")
                      response.raise_for_status()
             
             except requests.exceptions.HTTPError as e:
                 # Double check status in exception if raise_for_status wasn't called above for handled codes
-                if e.response.status_code in [480, 100]: # Should be handled in elif, but just in case
-                     wait_time = 10 * attempt
-                     print(f"Status {e.response.status_code}. Waiting {wait_time}s before retry...")
+                if e.response.status_code in [400, 480, 100]:
+                     wait_time = 3 * attempt
+                     print(f"Status {e.response.status_code} (Caught in Ex). Waiting {wait_time}s before retry...")
                      time.sleep(wait_time)
                      continue
                 else:
+                    print(f"Redeem Failed: {e}")
                     raise e
                     
+        print(f"--- end token redemption (FAILED) ---")
         raise Exception("Max retries reached for Token Redemption.")
 
     def authenticate(self):

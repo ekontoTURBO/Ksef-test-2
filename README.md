@@ -46,17 +46,22 @@ python main.py
 ```
 First run will open a browser window to authenticate with Google.
 
-## Dashboard Features (New)
-The script now applies a **Green Dashboard Layout** to the Google Sheet:
--   **Monthly Grouping**: Invoices are visually grouped by Month & Year (e.g., "October 2025").
+## Dashboard Features (Updated)
+The script now applies a **Polish Accounting Layout** to the Google Sheet:
+-   **Headers**: `KSeF ID`, `Sprzedawca`, `Nr dokumentu`, `Data`, `TERMIN`, `Netto`, `Brutto`, `Kategoria`, `PŁATNOŚĆ`, `LOKAL`, `UWAGI`.
+-   **Grouping**: Invoices are grouped by **Month & Year** (e.g., `--- LUTY 2026 ---`) and are **Collapsible** [-].
 -   **Ordering**:
-    -   **Months**: Newest month appears at the very top.
-    -   **Invoices**: Inside each month, invoices are sorted by date (earliest to latest).
--   **Summaries**: Total **Net** and **Gross** amounts are calculated and displayed at the top of each month block.
--   **Visuals**: Use of dark/light green backgrounds for headers and specific formatting.
--   **Automatic Sync**: The script creates and manages a sheet named **`KSeF Invoices Sync`** in your Google Drive. If deleted, it recreates it.
+    -   **Months**: Newest month appears at the top.
+    -   **Invoices**: Inside each month, invoices are sorted by date (**Oldest** to **Newest**).
+-   **Formatting**:
+    -   **Currency**: Netto & Brutto formatted as `#,##0.00 zł`.
+    -   **Green Theme**: Headers and separators use a green color scheme.
+-   **Data Preservation**: Manual notes updates in columns `Kategoria` through `UWAGI` are preserved during syncs.
+
+## Recent Fixes
+-   **Global Retry**: Authentication now handles `400 Bad Request` errors (KSeF warming up) with automatic retries.
+-   **Auto-Reauth**: Google `invalid_grant` errors trigger an automatic re-login flow to fix expired tokens.
 
 ## Known Limitations
--   **Date Range**: The KSeF API v2 limits query windows to **3 months**. The script currently defaults to a 1-month window (October 2025) for testing.
--   **Subject Type**: Currently configured to fetch **Sales Invoices** (`Subject1`).
+-   **Subject Type**: Configured to fetch **Purchase Invoices** (`Subject2`).
 

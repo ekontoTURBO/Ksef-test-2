@@ -262,7 +262,8 @@ def main():
         # Authenticate
         try:
             ksef.authenticate()
-        except Exception: 
+        except Exception as e: 
+            print(f"Authentication Failed: {e}")
             sys.exit(1)
             
         print(f"Fetching from {start_date_iso} to {end_date_iso}...")
@@ -327,48 +328,50 @@ def main():
     
     print(f"\nProcessing {len(invoices)} retrieved invoices...")
     for invoice in invoices:
-        # Field Mapping
-        # ksefReferenceNumber -> Col A
+        # 1. Extract Core Identifiers FIRST (Fix for UnboundLocalError)
         ksef_id = invoice.get('ksefReferenceNumber') or invoice.get('ksefNumber')
-        
-        if not ksef_id:
-             continue
-             
-        if ksef_id in existing_ids:
-            skipped_count += 1
-            # Verbose Logging for Duplicates
-            # Seller Name is not parsed yet, let's peek
-            s_name = invoice.get('seller', {}).get('name') or 'N/A'
-            print(f"Skipped Duplicate: {inv_num} - {s_name}")
-            continue
-            
-        # Parse Subject2 Fields
-        # invoiceNumber -> Col B
         inv_num = invoice.get('invoiceReferenceNumber') or invoice.get('invoiceNumber') or 'N/A'
         
-        # Seller NIP -> Col C
+        # 2. Extract Key Dates
+        inv_date = invoice.get('invoicingDate') or invoice.get('acquisitionDate') or 'N/A'
+        if inv_date and 'T' in inv_date:
+            inv_date = inv_date.split('T')[0]
+            
+        payment_due = invoice.get('paymentDueDate') or 'N/A'
+        if payment_due and 'T' in payment_due:
+            payment_due = payment_due.split('T')[0]
+
+        # 3. Extract Seller Info
         seller = invoice.get('seller', {})
-        seller_nip = seller.get('nip') or invoice.get('issuedBy', {}).get('identifier', {}).get('identifier') or 'N/A'
-        
-        # Seller Name -> Col D
+        # Try finding name in various places
         seller_name = seller.get('name') \
                       or invoice.get('issuedBy', {}).get('name', {}).get('tradeName') \
                       or invoice.get('issuedBy', {}).get('name', {}).get('fullName') \
                       or 'Unknown'
                       
-        # Invoicing Date -> Col E
-        inv_date = invoice.get('invoicingDate') or invoice.get('acquisitionDate') or 'N/A'
-        if inv_date and 'T' in inv_date:
-            inv_date = inv_date.split('T')[0]
+        seller_nip = seller.get('nip') or invoice.get('issuedBy', {}).get('identifier', {}).get('identifier') or 'N/A'
+
+        # 4. Check Duplicates with full info available for logging
+        if not ksef_id:
+             continue
+             
+        if ksef_id in existing_ids:
+            skipped_count += 1
+            # Now we have inv_num and seller_name available for the log
+            print(f"Skipped Duplicate: {inv_num} - {seller_name}")
+            continue
             
-        # Amounts -> Col F, G
+        # 5. Extract Amounts
         net = invoice.get('netAmount', 0.0)
         gross = invoice.get('grossAmount', 0.0)
+        # currency = invoice.get('currency', 'PLN') # Not used in new header structure directly, implied or separate?
+        # User requested headers: KSeF ID, Sprzedawca, Nr dokumentu, Data, TERMIN, Netto, Brutto, ...
         
-        # Currency -> Col H
-        curr = invoice.get('currency', 'PLN')
+        # 6. Build Row (Matches New Header Structure)
+        # Headers: [KSeF ID, Sprzedawca, Nr dokumentu, Data, TERMIN, Netto, Brutto, Kategoria, PŁATNOŚĆ, LOKAL, UWAGI]
+        # We only provide the first 7 columns data. The rest are placeholders for Manual Data.
+        row = [ksef_id, seller_name, inv_num, inv_date, payment_due, net, gross]
         
-        row = [ksef_id, inv_num, seller_nip, seller_name, inv_date, net, gross, curr]
         new_rows.append(row)
         existing_ids.add(ksef_id) # Prevent dupes in same batch
 

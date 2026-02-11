@@ -4,6 +4,7 @@ from collections import defaultdict
 import gspread
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from google.auth.exceptions import RefreshError
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 # If modifying these scopes, delete the file token.json.
@@ -18,29 +19,52 @@ class SheetsClient:
         self.sheet_name = sheet_name
         self.creds = None
         self.client = None
-        self.creds = None
-        self.client = None
-        self.spreadsheet = None # Store Spreadsheet object
+        self.spreadsheet = None 
         self.sheet = None
+        
+        self.month_names = {
+            1: "STYCZEŃ", 2: "LUTY", 3: "MARZEC", 4: "KWIECIEŃ", 5: "MAJ", 6: "CZERWIEC", 
+            7: "LIPIEC", 8: "SIERPIEŃ", 9: "WRZESIEŃ", 10: "PAŹDZIERNIK", 11: "LISTOPAD", 12: "GRUDZIEŃ"
+        }
 
     def authenticate(self):
         """Authenticates with Google and creates a gspread client."""
+        # Check existing token
         if os.path.exists("token.json"):
-            self.creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+            try:
+                self.creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+            except Exception:
+                print("Corrupted token.json found. Deleting...")
+                os.remove("token.json")
+                self.creds = None
         
-        if not self.creds or not self.creds.valid:
-            if self.creds and self.creds.expired and self.creds.refresh_token:
+        # If valid credentials exist, try to use/refresh them
+        if self.creds and self.creds.expired and self.creds.refresh_token:
+            try:
                 self.creds.refresh(Request())
-            else:
-                if not os.path.exists(self.credentials_path):
-                    raise FileNotFoundError(f"Missing {self.credentials_path}. Please download from Google Cloud Console.")
-                
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    self.credentials_path, SCOPES
-                )
-                self.creds = flow.run_local_server(port=8080)
+            except RefreshError:
+                print("Token expired and refresh failed (invalid_grant). Deleting token.json to re-authenticate...")
+                if os.path.exists("token.json"):
+                    os.remove("token.json")
+                self.creds = None
+            except Exception as e:
+                print(f"Error refreshing token: {e}. Deleting token.json...")
+                if os.path.exists("token.json"):
+                    os.remove("token.json")
+                self.creds = None
+
+        # If no valid creds (either didn't exist, expired & failed refresh, or deleted), do full login
+        if not self.creds or not self.creds.valid:
+            if not os.path.exists(self.credentials_path):
+                raise FileNotFoundError(f"Missing {self.credentials_path}.")
             
-            # Save the credentials for the next run
+            flow = InstalledAppFlow.from_client_secrets_file(
+                self.credentials_path, SCOPES
+            )
+            # FORCE offline access to get a refresh_token
+            # FORCE consent prompt to ensure we get a refresh_token even if user previously approved
+            self.creds = flow.run_local_server(port=8080, access_type='offline', prompt='consent')
+            
             with open("token.json", "w") as token:
                 token.write(self.creds.to_json())
 
@@ -48,44 +72,37 @@ class SheetsClient:
         print("Authenticated with Google Sheets.")
 
     def get_or_create_sheet(self):
-        """Opens the sheet or creates it if it doesn't exist."""
+        """Opens the sheet or creates it."""
         try:
             self.spreadsheet = self.client.open(self.sheet_name)
             self.sheet = self.spreadsheet.sheet1
             print(f"Opened existing sheet: {self.sheet_name}")
-            print(f"Sheet URL: {self.spreadsheet.url}")
         except gspread.exceptions.SpreadsheetNotFound:
             print(f"Sheet '{self.sheet_name}' not found. Creating...")
             self.spreadsheet = self.client.create(self.sheet_name)
             self.sheet = self.spreadsheet.sheet1
-            print(f"Created new sheet: {self.sheet_name}")
-            print(f"Sheet URL: {self.spreadsheet.url}")
-            # Add Headers
+            # Add Headers immediately
             headers = [
-                "KSeF ID", "Invoice Number", "Seller NIP", "Seller Name", 
-                "Issue Date", "Net Amount", "Gross Amount", "Currency"
+                "KSeF ID", "Sprzedawca", "Nr dokumentu", "Data", "TERMIN", 
+                "Netto", "Brutto", "Kategoria", "PŁATNOŚĆ", "LOKAL", "UWAGI"
             ]
             self.sheet.append_row(headers)
             print("Created new sheet with headers.")
 
     def clear_sheet(self):
-        """Clears the sheet and re-adds headers."""
-        print("Clearing entire sheet...")
+        """Clears the sheet."""
+        print("Clearing sheet...")
         self.sheet.clear()
         headers = [
-            "KSeF ID", "Invoice Number", "Seller NIP", "Seller Name", 
-            "Issue Date", "Net Amount", "Gross Amount", "Currency"
+            "KSeF ID", "Sprzedawca", "Nr dokumentu", "Data", "TERMIN", 
+            "Netto", "Brutto", "Kategoria", "PŁATNOŚĆ", "LOKAL", "UWAGI"
         ]
         self.sheet.append_row(headers)
-        print("Sheet cleared and headers re-added.")
 
     def get_existing_ids(self):
-        """Fetches all KSeF IDs from Column A to avoid duplicates."""
-        # Assuming KSeF ID is in Column 1 (A)
+        """Fetches all KSeF IDs from Column A."""
         try:
-            # fast method to get first column
             ids = self.sheet.col_values(1)
-            # Remove header if present
             if ids and ids[0] == "KSeF ID":
                 return set(ids[1:])
             return set(ids)
@@ -93,209 +110,309 @@ class SheetsClient:
             print(f"Warning reading existing IDs: {e}")
             return set()
 
-    def append_invoices(self, rows):
-        """Appends a list of rows to the sheet."""
-        if not rows:
-            return
-        
-        print(f"Appending {len(rows)} rows to Sheet...")
-        self.sheet.append_rows(rows)
-        print("Done.")
-
     def sync_formatted_data(self, new_rows):
         """
-        Reads all existing data, merges with new rows, groups by month,
-        and writes a formatted dashboard style layout.
+        Main Overhaul Logic:
+        1. Read ALL data (preserve manual cols).
+        2. Merge with NEW data.
+        3. Sort by Date Ascending.
+        4. Group by Month (with Headers).
+        5. Rewrite Sheet & Apply Formatting.
         """
-
-        # 1. Fetch All Existing Data
-        # We need headers to know indices if we parse.
-        # But simpler: Assume our fixed columns.
-        print("Reading all existing data for re-formatting...")
+        print("--- syncing formatted data ---")
+        
+        # --- Step 1: Read Existing Data & Map Manual Columns ---
         all_values = self.sheet.get_all_values()
+        existing_data_map = {} # Map KSeF ID -> [Manual Cols Data]
         
-        # Headers are usually row 1
-        headers = [
-            "KSeF ID", "Invoice Number", "Seller NIP", "Seller Name", 
-            "Issue Date", "Net Amount", "Gross Amount", "Currency"
-        ]
-        
-        existing_rows = []
-        existing_ids = set()
+        # Headers are: KSeF ID (0), ..., Netto(5), Brutto(6), Kategoria(7), PŁATNOŚĆ(8), LOKAL(9), UWAGI(10)
+        # We need to preserve cols 7, 8, 9, 10 (Indices 7-10)
         
         if all_values:
-            # Check if first row is header
-            if all_values[0] and all_values[0][0] == "KSeF ID":
-                 raw_data = all_values[1:]
-            else:
-                 raw_data = all_values
-                 
-            # Filter out non-data rows (e.g. Total rows from previous runs)
-            # We identify data rows by having a KSeF ID in col 0.
-            for r in raw_data:
-                # KSeF ID is 36 chars usually, or at least not empty/Total/Month
-                if len(r) > 0 and r[0] and len(r[0]) > 10 and "Total" not in r[0]:
-                    existing_rows.append(r)
-                    existing_ids.add(r[0])
-
-        # 2. Merge New Data
-        # new_rows is list of lists
-        print(f"Merging {len(existing_rows)} existing + {len(new_rows)} new invoices...")
-        
-        final_dataset = []
-        final_dataset.extend(existing_rows)
-        
-        count_added = 0
-        for row in new_rows:
-            kid = row[0]
-            if kid not in existing_ids:
-                final_dataset.append(row)
-                existing_ids.add(kid)
-                count_added += 1
+            # Skip header if present
+            start_idx = 1 if (all_values and all_values[0] and all_values[0][0] == "KSeF ID") else 0
+            
+            for row in all_values[start_idx:]:
+                if not row or not row[0]: continue # Skip empty
                 
-        if not final_dataset:
-            print("No data to write.")
-            return
+                k_id = row[0]
+                # Extract manual cols. logic: ensure row has enough cols
+                manual_notes = ["", "", "", ""] # Default empty for 4 cols
+                
+                # Slices for manual cols (7 to 11)
+                if len(row) > 7:
+                    manual_segment = row[7:11]
+                    # Fill logic
+                    for i in range(len(manual_segment)):
+                        manual_notes[i] = manual_segment[i]
+                
+                existing_data_map[k_id] = manual_notes
 
-        # 3. Sort & Group
-        # We need to sort by Date Ascending first?
-        # Helper to parse date
-        def parse_date(date_str):
+        # --- Step 2: Merge Data ---
+        # new_rows structure: [ID, Sprzedawca, Nr, Data, Termin, Net, Gross] (Length 7)
+        # We need to construct full rows: [Basic 7] + [Manual 4]
+        
+        merged_rows = []
+        processed_ids = set()
+        
+        # A. Add New Rows (and update if they existed, keeping notes)
+        for r in new_rows:
+            k_id = r[0]
+            manual = existing_data_map.get(k_id, ["", "", "", ""])
+            full_row = r + manual
+            merged_rows.append(full_row)
+            processed_ids.add(k_id)
+            
+        # B. Add 'Only Existing' Rows (that were not in new_rows, but are in sheet)
+        # We need to reconstruct their basic data too? 
+        # Wait. 'new_rows' only contains *fetched* rows.
+        # If we are doing 'Incremental Sync', we might miss old rows if we don't read them back.
+        # Current logic in main.py fetches *duplicates* but potentially filters them out before calling this?
+        # NO. main.py 'new_rows' ONLY contains rows that were NOT in 'existing_ids'.
+        # So 'new_rows' are purely NEW.
+        
+        # The 'existing_data_map' only stored manual notes. We need the FULL existing row data!
+        # Let's adjust Step 1.
+        
+        existing_full_rows = []
+        if all_values:
+             start_idx = 1 if (all_values and all_values[0] and all_values[0][0] == "KSeF ID") else 0
+             for row in all_values[start_idx:]:
+                 if not row or not row[0]: continue
+                 # Filter out Month Header rows (e.g. "--- STYCZEŃ ---")
+                 if row[0].startswith("---"): continue
+                 if "Total Net" in row[0] or (len(row) > 5 and "Total Net" in str(row[5])): continue # Summary rows? 
+                 # Actually summary rows have empty first col usually?
+                 if not row[0].strip(): continue
+                 
+                 existing_full_rows.append(row)
+                 
+        # Now Merge:
+        # Start with Existing Rows...
+        final_dataset = []
+        existing_ids_set = set()
+        
+        for row in existing_full_rows:
+            final_dataset.append(row)
+            if row[0]: existing_ids_set.add(row[0])
+            
+        # Add New Rows
+        for row in new_rows:
+            k_id = row[0]
+            if k_id not in existing_ids_set:
+                 # Standardize length to 11
+                 while len(row) < 11:
+                     row.append("")
+                 final_dataset.append(row)
+                 existing_ids_set.add(k_id)
+
+        # --- Step 3: Sort by Date Ascending ---
+        def parse_date(d_str):
+            if not d_str: return datetime.date.max
             try:
-                # Try ISO
-                return datetime.date.fromisoformat(date_str[:10])
-            except:
-                return datetime.date.min
+                return datetime.date.fromisoformat(d_str)
+            except ValueError:
+                return datetime.date.max # Push invalid to end
+        
+        # Date is column Index 3 (0-based: ID, Sprz, Nr, Data)
+        final_dataset.sort(key=lambda x: parse_date(x[3]))
 
-        # Sort all by date ASC (Earliest -> Oldest)
-        # This ensures within a month, 1st is top, 30th is bottom.
-        final_dataset.sort(key=lambda x: parse_date(x[4])) # Col 4 is Issue Date
-
-        # Group by Month-Year
-        # We want Groups sorted Descending (Newest Month Top).
-        groups = defaultdict(list)
-        for row in final_dataset:
-            d = parse_date(row[4])
-            key = (d.year, d.month) # (2025, 10)
-            groups[key].append(row)
-            
-        # Sort groups keys Descending
-        # Filter out invalid dates (year 0001)
-        valid_groups = {}
-        for key, val in groups.items():
-            if key[0] <= 1900: # Simple check for 0001 or insane dates
-                print(f"Warning: Found {len(val)} invoices with invalid dates (Year {key[0]}). Skipping them.")
-                # Optional: Print IDs of skipped?
-                continue
-            if not val:
-                 continue
-            valid_groups[key] = val
-            
-        sorted_keys = sorted(valid_groups.keys(), reverse=True)
-
-        # 4. Construct Output
+        # --- Step 4: Group & Construct Output ---
         output_rows = []
         
-        # Green Color for Headers and Summaries
-        # We will apply formatting after writing using batch_update if needed, 
-        # or just rely on structure first.
-        # User asked for "Green colors". We'll try to set headers.
+        # Headers
+        headers = [
+            "KSeF ID", "Sprzedawca", "Nr dokumentu", "Data", "TERMIN", 
+            "Netto", "Brutto", "Kategoria", "PŁATNOŚĆ", "LOKAL", "UWAGI"
+        ]
+        output_rows.append(headers)
         
-        requests_fmt = [] # For batch_update formatting
-        row_index = 0
+        row_groups = [] # List of {'start': int, 'length': int, 'depth': 1}
+        # Actually API needs startIndex and endIndex.
         
-        # We'll build the output list of lists.
+        current_month_key = None
+        group_start_index = None # 1-based index (Sheets API uses 0-based for specific calls, but usually 0-index)
         
-        for (year, month) in sorted_keys:
-            # valid_groups ensure we only process months with data
-            block_invoices = valid_groups[(year, month)]
-            if not block_invoices:
-                 continue
+        # The first data row is at index 1 (after header).
+        current_write_idx = 1 
+        
+        today = datetime.date.today()
+        current_real_month_key = (today.year, today.month)
+        
+        groups_metadata = [] # List of tuples (startIndex, endIndex, is_collapsed)
+        
+        # Helper to get month key
+        def get_month_key(row):
+            d = parse_date(row[3])
+            if d == datetime.date.max: return None
+            return (d.year, d.month)
 
-            month_name = datetime.date(year, month, 1).strftime("%B %Y")
+        # We will iterate and insert Header Rows
+        # But we need to separate data into blocks first to insert headers easily
+        from itertools import groupby
+        
+        # Group by YearMonth
+        # Note: groupby matches consecutive keys. Sort is active, so this works.
+        grouped_data = groupby(final_dataset, key=get_month_key)
+        
+        for (year, month), items in grouped_data:
+            if not year or not month: continue # Skip invalid
             
-            # Calculate Sums
-            total_net = sum(float(r[5]) if r[5] else 0 for r in block_invoices)
-            total_gross = sum(float(r[6]) if r[6] else 0 for r in block_invoices)
-            currency = block_invoices[0][7] if block_invoices else "PLN"
+            month_items = list(items)
             
-            # 1. Spacer (if not first)
-            if output_rows:
-                output_rows.append([""]) # Empty row
-                row_index += 1
-                
-            # 2. Header Row (Month)
-            output_rows.append([month_name])
-            header_row_idx = row_index
-            row_index += 1
+            # 1. Insert Month Header Row
+            month_pl = self.month_names.get(month, "MIESIĄC")
+            header_text = f"--- {month_pl} {year} ---"
             
-            # 3. Summary Row
-            summary_text_net = f"Total Net: {total_net:.2f} {currency}"
-            summary_text_gross = f"Total Gross: {total_gross:.2f} {currency}"
-            output_rows.append(["", "", "", "", "", summary_text_net, summary_text_gross, ""])
-            summary_row_idx = row_index
-            row_index += 1
+            # Header Row
+            output_rows.append([header_text])
+            header_row_idx = current_write_idx
+            current_write_idx += 1
             
-            # 4. Column Headers
-            output_rows.append(headers)
-            col_header_idx = row_index
-            row_index += 1
+            # 2. Add Items
+            for item in month_items:
+                output_rows.append(item)
             
-            # 5. Data Rows
-            # Already sorted Ascending date
-            output_rows.extend(block_invoices)
-            row_index += len(block_invoices)
+            count = len(month_items)
             
-            # Formatting Requests (Green Backgrounds)
-            # Row indices are 0-based for list, but 0-based for API? Yes.
+            # 3. Define Group Range
+            # Group should contain the ITEMS, but usually header is visible?
+            # User logic: "Collapse previous months".
+            # Usually you group the rows UNDER the header.
+            # Start: header_row_idx + 1. End: header_row_idx + count.
+            # OR include header? Likely want header visible, rows hidden.
             
-            # Month Header: Dark Green, White Text, Bold, Merged?
-            requests_fmt.append({
-                "repeatCell": {
-                    "range": {"sheetId": self.sheet.id, "startRowIndex": header_row_idx, "endRowIndex": header_row_idx+1, "startColumnIndex": 0, "endColumnIndex": 8},
-                    "cell": {"userEnteredFormat": {"backgroundColor": {"red": 0.2, "green": 0.5, "blue": 0.3}, "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1}, "bold": True, "fontSize": 12}}},
-                    "fields": "userEnteredFormat(backgroundColor,textFormat)"
-                }
+            g_start = header_row_idx + 1
+            g_end = header_row_idx + count # Inclusive for logic, but API might differ
+            
+            # API addDimensionGroup: range is startIndex (inclusive) to endIndex (exclusive)
+            # We want to group the DATA rows.
+            # So from g_start (row index) to g_start + count.
+            
+            is_current_month = (year == current_real_month_key[0] and month == current_real_month_key[1])
+            collapsed = not is_current_month
+            
+            groups_metadata.append({
+                "range": {
+                    "sheetId": self.sheet.id,
+                    "dimension": "ROWS",
+                    "startIndex": g_start, 
+                    "endIndex": g_start + count
+                },
+                "collapsed": collapsed
             })
             
-            # Summary Row: Light Green
-            requests_fmt.append({
-                "repeatCell": {
-                    "range": {"sheetId": self.sheet.id, "startRowIndex": summary_row_idx, "endRowIndex": summary_row_idx+1, "startColumnIndex": 0, "endColumnIndex": 8},
-                    "cell": {"userEnteredFormat": {"backgroundColor": {"red": 0.85, "green": 0.95, "blue": 0.85}, "textFormat": {"bold": True}}},
-                    "fields": "userEnteredFormat(backgroundColor,textFormat)"
-                }
-            })
-            
-            # Column Header Row: Medium Green
-            requests_fmt.append({
-                "repeatCell": {
-                    "range": {"sheetId": self.sheet.id, "startRowIndex": col_header_idx, "endRowIndex": col_header_idx+1, "startColumnIndex": 0, "endColumnIndex": 8},
-                    "cell": {"userEnteredFormat": {"backgroundColor": {"red": 0.4, "green": 0.7, "blue": 0.5}, "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1}, "bold": True}}},
-                    "fields": "userEnteredFormat(backgroundColor,textFormat)"
-                }
-            })
+            current_write_idx += count
 
-        # Write to Sheet
-        print("Clearing sheet and writing formatted data...")
+        # --- Step 5: Write & Format ---
+        print("Writing rewritten data to Sheet...")
+        
+        # Check size safe
         self.sheet.clear()
-        # Update starting from A1
-        # Using named arguments generic enough for recent gspread versions
-        try:
-             self.sheet.update(range_name='A1', values=output_rows)
-        except TypeError:
-             # Fallback for older gspread
-             self.sheet.update('A1', output_rows)
         
-        # Apply Formatting
-        if requests_fmt:
-            print("Applying Green Styles...")
-            body = {"requests": requests_fmt}
-            # formatting requests must go to the SPREADSHEET
-            if self.spreadsheet:
-                self.spreadsheet.batch_update(body)
-            else:
-                # Fallback if not set (unlikely)
-                print("Warning: Spreadsheet object not available for formatting.")
+        try:
+             self.sheet.update("A1", output_rows)
+        except Exception:
+             self.sheet.update(range_name="A1", values=output_rows)
+             
+        # Generate Batch Updates
+        requests = []
+        
+        # 1. Remove all existing groups first?
+        # To be safe, we should probably clear groups.
+        requests.append({
+            "deleteDimensionGroup": {
+                "range": {
+                    "sheetId": self.sheet.id,
+                    "dimension": "ROWS",
+                    "startIndex": 0,
+                    "endIndex": len(output_rows) + 100
+                }
+            }
+        })
+        
+        # 2. Add Groups
+        # We need to add groups, then set their collapsed state.
+        # Actually 'addDimensionGroup' doesn't set collapsed. 'updateDimensionGroup' does?
+        # Or we rely on UI manual click? User asked: "collapsed/hide previous months"
+        
+        # We process groups in reverse order to avoid index shifts? No, groups don't shift indices.
+        
+        for g in groups_metadata:
+            # Create Group
+            requests.append({
+                "addDimensionGroup": {
+                    "range": g["range"]
+                }
+            })
             
-        print("Sync & Format Complete!")
+            # Collapse/Expand (UpdateDimensionGroup functionality or specific Toggle)
+            # Actually, to set collapsed state, use updateDimensionGroup
+            # But we just created it.
+            # Note: We can't consistently set 'collapsed' flag easily in one batch with creation 
+            # without complex logic in some APIs.
+            # However, standard practice: Create, then Update.
+            
+            if g["collapsed"]:
+                 # We need to target the group we just made. 
+                 # The 'range' identifies it.
+                 requests.append({
+                     "updateDimensionGroup": {
+                         "dimensionGroup": {
+                             "range": g["range"],
+                             "depth": 1,
+                             "collapsed": True
+                         },
+                         "fields": "collapsed"
+                     }
+                 })
+                 
+        # 3. Formatting
+        # Header Row (Row 0): Green
+        requests.append({
+            "repeatCell": {
+                "range": {"sheetId": self.sheet.id, "startRowIndex": 0, "endRowIndex": 1},
+                "cell": {"userEnteredFormat": {"backgroundColor": {"red": 0.2, "green": 0.6, "blue": 0.3}, "textFormat": {"foregroundColor": {"red": 1,"green": 1,"blue": 1}, "bold": True}}},
+                "fields": "userEnteredFormat(backgroundColor,textFormat)"
+            }
+        })
+        
+        # Column Formatting
+        # Netto (F/5), Brutto (G/6) -> Currency
+        # Columns 5 and 6.
+        requests.append({
+            "repeatCell": {
+                "range": {"sheetId": self.sheet.id, "startColumnIndex": 5, "endColumnIndex": 7},
+                "cell": {"userEnteredFormat": {"numberFormat": {"type": "CURRENCY", "pattern": "#,##0.00 zł"}}},
+                "fields": "userEnteredFormat(numberFormat)"
+            }
+        })
+        
+        # Month Headers (Optional: Center, Bold, Light Green)
+        # We need to find their indices again? Or just iterate output_rows
+        # Iterating output_rows is safer.
+        for idx, row in enumerate(output_rows):
+            if row and len(row) > 0 and str(row[0]).startswith("---"):
+                requests.append({
+                    "repeatCell": {
+                        "range": {"sheetId": self.sheet.id, "startRowIndex": idx, "endRowIndex": idx+1},
+                        "cell": {"userEnteredFormat": {"backgroundColor": {"red": 0.9, "green": 0.95, "blue": 0.9}, "horizontalAlignment": "CENTER", "textFormat": {"bold": True}}},
+                        "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment)"
+                    }
+                })
+                # Merge Cells for header
+                requests.append({
+                    "mergeCells": {
+                        "range": {"sheetId": self.sheet.id, "startRowIndex": idx, "endRowIndex": idx+1, "startColumnIndex": 0, "endColumnIndex": 11},
+                        "mergeType": "MERGE_ALL"
+                    }
+                })
+
+        # Execute Batch Update
+        print("Applying Groups and Formatting...")
+        try:
+            self.spreadsheet.batch_update({"requests": requests})
+        except Exception as e:
+            print(f"Formatting Warning (Groups might already exist or conflict): {e}")
+
+        print("Sync Complete.")
