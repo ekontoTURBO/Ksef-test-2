@@ -17,3 +17,7 @@ log_debug.txt
 
 # Artifacts/Debug
 last_response.json
+debug_invoice.json
+
+# Client Configuration & Sensitive Data
+client_metadata.json

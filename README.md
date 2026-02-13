@@ -94,7 +94,19 @@ The script applies a **Polish Accounting Layout** to the Google Sheet:
 -   **Data Preservation**: Manual notes in columns `Kategoria`-`UWAGI` are preserved.
 
 ## Recent Fixes
+-   **Critical Data Mapping**: Fixed issue where API v2 keys (`ksefNumber`, `netAmount`) were not being mapped, causing empty rows.
 -   **Robust Auth**: Handles KSeF session warming (400 errors) with exponential backoff.
 -   **Auto-Recovery**: Handles JSON errors gracefully.
 -   **Universal Date Parsing**: Supports full ISO timestamps.
+
+## Security & Privacy
+The following files contain sensitive information and **MUST NOT** be committed to version control (GitHub/GitLab):
+
+1.  **`.env`**: Contains your NIP and Authentication Token.
+2.  **`credentials.json`**: Your Google Cloud Service credentials.
+3.  **`token.json`**: Your personal Google OAuth session token.
+4.  **`client_metadata.json`**: local configuration (Client Name, Email).
+5.  **`debug_invoice.json`**: Temporary dump of invoice data for debugging (contains real financial data).
+
+These are automatically added to `.gitignore`. Ensure they remain private.
 
