@@ -1,0 +1,33 @@
+{
+    "ksefNumber": "6342374592-20260202-D500E0C0BA31-EE",
+    "invoiceNumber": "2026/02/274689/SP/2",
+    "issueDate": "2026-02-02",
+    "invoicingDate": "2026-02-02T07:14:31.281451+00:00",
+    "acquisitionDate": "2026-02-02T07:14:32.693289+00:00",
+    "permanentStorageDate": "2026-02-02T07:14:34.11518+00:00",
+    "seller": {
+        "nip": "6342374592",
+        "name": "SOLID GROUP sp. z o.o. sp. k."
+    },
+    "buyer": {
+        "identifier": {
+            "type": "Nip",
+            "value": "6430004340"
+        },
+        "name": "FHU SABO BOGDAN SZAMBURSKI"
+    },
+    "netAmount": 77,
+    "grossAmount": 94.71,
+    "vatAmount": 17.71,
+    "currency": "PLN",
+    "invoicingMode": "Online",
+    "invoiceType": "Vat",
+    "formCode": {
+        "systemCode": "FA (3)",
+        "schemaVersion": "1-0E",
+        "value": "FA"
+    },
+    "isSelfInvoicing": false,
+    "hasAttachment": false,
+    "invoiceHash": "HcXro2quKEGMN29awC1pTuRDvzzw5PJy+aZHG0kESYo="
+}

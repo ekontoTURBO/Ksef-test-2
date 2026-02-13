@@ -36,32 +36,65 @@ Run the following command in your terminal:
 pip install -r requirements.txt
 ```
 
-### 3. Application setup
-The `.env` file is pre-configured with the provided KSeF Test Token and NIP.
-Ensure `credentials.json` is present.
+## Configuration (.env)
+
+The application now strictly uses `.env` for configuration.
+Ensure your `.env` file contains:
+
+```ini
+# Options: PROD, TEST, DEMO
+KSEF_ENV=PROD
+
+# Credentials
+KSEF_NIP=your_nip
+KSEF_TOKEN=your_ksef_token
+
+# Google Config
+GOOGLE_CREDENTIALS_PATH=credentials.json
+# Default Sheet Name (overridden by First Run Wizard)
+GOOGLE_SHEET_NAME=KSeF Invoices Sync
+```
 
 ## Running the Script
+
+### Manual Mode (Interactive Menu)
 ```bash
 python main.py
 ```
-First run will open a browser window to authenticate with Google.
+-   **First Run**: You will be asked to provide Client Name, Sheet Name, Boss Email, and Frequency.
+-   **Menu**:
+    -   `[1] Sync`: Synchronize invoices.
+    -   `[R] Reset`: Delete local configuration and restart setup.
+    -   `[E] Exit`: Close application.
+
+### Auto Mode (Cron/Cloud)
+```bash
+python main.py --auto
+```
+-   Bypasses the menu.
+-   Loads configuration from `client_metadata.json` (must be set up once manually or pre-seeded).
+-   Synchronizes invoices from the **last 24 hours**.
+
+### Docker Support
+Build and run the container:
+```bash
+docker build -t ksef-sync .
+docker run --env-file .env ksef-sync
+```
 
 ## Dashboard Features (Updated)
-The script now applies a **Polish Accounting Layout** to the Google Sheet:
+The script applies a **Polish Accounting Layout** to the Google Sheet:
 -   **Headers**: `KSeF ID`, `Sprzedawca`, `Nr dokumentu`, `Data`, `TERMIN`, `Netto`, `Brutto`, `Kategoria`, `PŁATNOŚĆ`, `LOKAL`, `UWAGI`.
--   **Grouping**: Invoices are grouped by **Month & Year** (e.g., `--- LUTY 2026 ---`) and are **Collapsible** [-].
+-   **Sharing**: Automatically shares the sheet with the configured `boss_email` as Editor.
+-   **Grouping**: Invoices are grouped by **Month & Year** and are **Collapsible**.
 -   **Ordering**:
     -   **Months**: Newest month appears at the top.
     -   **Invoices**: Inside each month, invoices are sorted by date (**Oldest** to **Newest**).
--   **Formatting**:
-    -   **Currency**: Netto & Brutto formatted as `#,##0.00 zł`.
-    -   **Green Theme**: Headers and separators use a green color scheme.
--   **Data Preservation**: Manual notes updates in columns `Kategoria` through `UWAGI` are preserved during syncs.
+-   **Formatting**: Currency (`#,##0.00 zł`) and Green Theme.
+-   **Data Preservation**: Manual notes in columns `Kategoria`-`UWAGI` are preserved.
 
 ## Recent Fixes
--   **Global Retry**: Authentication now handles `400 Bad Request` errors (KSeF warming up) with automatic retries.
--   **Auto-Reauth**: Google `invalid_grant` errors trigger an automatic re-login flow to fix expired tokens.
-
-## Known Limitations
--   **Subject Type**: Configured to fetch **Purchase Invoices** (`Subject2`).
+-   **Robust Auth**: Handles KSeF session warming (400 errors) with exponential backoff.
+-   **Auto-Recovery**: Handles JSON errors gracefully.
+-   **Universal Date Parsing**: Supports full ISO timestamps.
 

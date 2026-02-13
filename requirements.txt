@@ -1,5 +1,8 @@
-requests==2.31.0
-cryptography==42.0.5
-gspread==6.0.0
-google-auth-oauthlib==1.2.0
-python-dotenv==1.0.1
+requests
+python-dotenv
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
+gspread
+cryptography

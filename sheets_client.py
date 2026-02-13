@@ -6,6 +6,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google.auth.exceptions import RefreshError
 from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build # Added for Drive API
 
 # If modifying these scopes, delete the file token.json.
 SCOPES = [
@@ -70,6 +71,34 @@ class SheetsClient:
 
         self.client = gspread.authorize(self.creds)
         print("Authenticated with Google Sheets.")
+
+    def share_sheet(self, email):
+        """Shares the spreadsheet with the specified email using Drive API."""
+        if not self.spreadsheet:
+             print("Spreadsheet not open, cannot share.")
+             return
+
+        try:
+            drive_service = build('drive', 'v3', credentials=self.creds)
+            
+            # Check if already shared? API allows redundancy, usually fine.
+            # We want 'writer' role.
+            permission = {
+                'type': 'user',
+                'role': 'writer',
+                'emailAddress': email
+            }
+            
+            print(f"Sharing sheet '{self.sheet_name}' with {email}...")
+            drive_service.permissions().create(
+                fileId=self.spreadsheet.id,
+                body=permission,
+                fields='id'
+            ).execute()
+            print("Shared successfully.")
+            
+        except Exception as e:
+            print(f"Error sharing sheet: {e}")
 
     def get_or_create_sheet(self):
         """Opens the sheet or creates it."""
@@ -212,7 +241,10 @@ class SheetsClient:
             try:
                 return datetime.date.fromisoformat(d_str)
             except ValueError:
-                return datetime.date.max # Push invalid to end
+                try:
+                    return datetime.datetime.fromisoformat(d_str).date()
+                except ValueError:
+                    return datetime.date.max # Push invalid to end
         
         # Date is column Index 3 (0-based: ID, Sprz, Nr, Data)
         final_dataset.sort(key=lambda x: parse_date(x[3]))
@@ -255,16 +287,17 @@ class SheetsClient:
         # Note: groupby matches consecutive keys. Sort is active, so this works.
         grouped_data = groupby(final_dataset, key=get_month_key)
         
-        for (year, month), items in grouped_data:
-            if not year or not month: continue # Skip invalid
+        for key, items in grouped_data:
+            if not key: continue # Skip invalid dates (grouped at end)
             
+            year, month = key
             month_items = list(items)
             
-            # 1. Insert Month Header Row
+    # 1. Insert Month Header Row
             month_pl = self.month_names.get(month, "MIESIĄC")
             header_text = f"--- {month_pl} {year} ---"
             
-            # Header Row
+            # Header Row - MUST be a list to occupy the row correctly
             output_rows.append([header_text])
             header_row_idx = current_write_idx
             current_write_idx += 1

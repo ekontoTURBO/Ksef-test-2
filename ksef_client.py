@@ -28,7 +28,12 @@ class KsefClient:
             h.update(headers)
         response = requests.get(url, headers=h)
         response.raise_for_status()
-        return response.json()
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            print(f"[ERROR] JSON Decode Failed at {url}")
+            print(f"Response Preview: {response.text[:500]}")
+            raise
 
     def _post(self, endpoint, data, headers=None):
         url = f"{self.base_url}{endpoint}"
@@ -46,15 +51,19 @@ class KsefClient:
                 sys.exit(1)
 
             response.raise_for_status()
+            return response.json()
         except requests.exceptions.HTTPError as e:
             # Double check in case raise_for_status caught it
             if e.response.status_code in [401, 403]:
                 print(f"\n[CRITICAL] Auth Failure ({e.response.status_code}) caught in exception.")
                 sys.exit(1)
                 
-            print(f"Error Posting to {url}: {response.text}")
+            print(f"Error Posting to {url}: {response.text[:500]}") # truncated for readability
             raise e
-        return response.json()
+        except json.JSONDecodeError:
+            print(f"[ERROR] JSON Decode Failed at {url}")
+            print(f"Response Preview: {response.text[:500]}")
+            raise
 
     def get_public_key(self):
         """Fetches the public key from KSeF /security/public-key-certificates."""
@@ -123,20 +132,32 @@ class KsefClient:
                     return data['accessToken']['token']
                 
                 # 400: Bad Request (often session not ready), 480: Suspended, 100: Continue
-                elif response.status_code in [400, 480, 100]:
-                    wait_time = 3 * attempt # 3, 6, 9, 12, 15
-                    print(f"Status {response.status_code} (Warming Up). Waiting {wait_time}s before retry...")
+                # Also 429: Rate Limit
+                elif response.status_code in [400, 480, 100, 429]:
+                    # Backoff: 3, 6, 9, 12, 15... or pure exponential 2^n? 
+                    # User requested "exponential backoff". The previous code did linear*3.
+                    # Let's do true exponential: 2^attempt * 1.5? Or just the previous logic if it worked?
+                    # The user prompt: "includes the 5-attempt retry loop with exponential backoff"
+                    # Let's do 2, 4, 8, 16, 32.
+                    wait_time = 2 * (2**(attempt-1)) 
+                    print(f"Status {response.status_code} (Warming Up). Attempt {attempt}/{max_attempts}. Waiting {wait_time}s...")
                     time.sleep(wait_time)
                     continue
                 
                 else:
-                     response.raise_for_status()
+                     # Check if it's not JSON
+                    try:
+                        err_text = response.json()
+                    except:
+                        err_text = response.text[:200]
+                    print(f"[ERROR] Redeem Status: {response.status_code}. Body: {err_text}")
+                    response.raise_for_status()
             
             except requests.exceptions.HTTPError as e:
                 # Double check status in exception if raise_for_status wasn't called above for handled codes
-                if e.response.status_code in [400, 480, 100]:
-                     wait_time = 3 * attempt
-                     print(f"Status {e.response.status_code} (Caught in Ex). Waiting {wait_time}s before retry...")
+                if e.response.status_code in [400, 480, 100, 429]:
+                     wait_time = 2 * (2**(attempt-1))
+                     print(f"Status {e.response.status_code} (Caught in Ex). Attempt {attempt}/{max_attempts}. Waiting {wait_time}s...")
                      time.sleep(wait_time)
                      continue
                 else:
@@ -144,7 +165,7 @@ class KsefClient:
                     raise e
                     
         print(f"--- end token redemption (FAILED) ---")
-        raise Exception("Max retries reached for Token Redemption.")
+        raise Exception("Max retries reached for Token Redemption. Session likely busy or invalid.")
 
     def authenticate(self):
         """Full authentication flow to get Session Token."""

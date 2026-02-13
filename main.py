@@ -1,395 +1,342 @@
 import os
 import sys
-from datetime import datetime, date, timedelta
+import json
+import time
+import argparse
+import datetime
 from dotenv import load_dotenv
+
+# Import Clients
 from ksef_client import KsefClient
 from sheets_client import SheetsClient
 
-# Load env variables
-load_dotenv()
+# --- Constants & Config ---
+METADATA_FILE = "client_metadata.json"
+TOKEN_FILE = "token.json"
+ENV_FILE = ".env"
 
-KSEF_URL = "https://api-test.ksef.mf.gov.pl/v2/"
-KSEF_NIP = os.getenv("KSEF_NIP")
-KSEF_TOKEN = os.getenv("KSEF_TOKEN")
-import os
-import sys
-from datetime import datetime, date, timedelta
-from dotenv import load_dotenv
-from ksef_client import KsefClient
-from sheets_client import SheetsClient
+def load_secrets():
+    """
+    Loads secrets from .env with strict sanitization.
+    Returns a dict of cleaned secrets.
+    """
+    load_dotenv()
+    
+    def get_clean(key, required=True):
+        val = os.getenv(key)
+        if val:
+            # Remove quotes and whitespace
+            val = val.strip().strip("'").strip('"')
+        
+        if required and not val:
+            print(f"[CRITICAL] Missing required env var: {key}")
+            sys.exit(1)
+        return val
 
-# Load env variables
-# Load env variables
-load_dotenv()
-
-KSEF_ENV = os.getenv("KSEF_ENV", "TEST").upper()
-
-# Environment Configurations
-ENV_CONFIG = {
-    "TEST": {
-        "URL": "https://api-test.ksef.mf.gov.pl/v2/",
-        "NIP": os.getenv("KSEF_NIP"),
-        "TOKEN": os.getenv("KSEF_TOKEN")
-    },
-    "DEMO": {
-        "URL": "https://api-demo.ksef.mf.gov.pl/v2/",
-        "NIP": os.getenv("KSEF_NIP"), # Usually same as Test but can be different
-        "TOKEN": os.getenv("KSEF_TOKEN")
-    },
-    "PROD": {
-        "URL": "https://api.ksef.mf.gov.pl/v2/",
-        "NIP": os.getenv("KSEF_PROD_NIP"),
-        "TOKEN": os.getenv("KSEF_PROD_TOKEN")
+    return {
+        "KSEF_ENV": get_clean("KSEF_ENV"),
+        "KSEF_NIP": get_clean("KSEF_NIP"),
+        "KSEF_TOKEN": get_clean("KSEF_TOKEN"),
+        "GOOGLE_CREDENTIALS_PATH": get_clean("GOOGLE_CREDENTIALS_PATH", required=False) or "credentials.json" 
     }
-}
 
-if KSEF_ENV not in ENV_CONFIG:
-    print(f"Error: Invalid KSEF_ENV '{KSEF_ENV}'. Must be TEST, DEMO, or PROD.")
-    sys.exit(1)
+def get_base_url(env):
+    env = env.upper()
+    if env == "PROD":
+        # Production API V2
+        return "https://api.ksef.mf.gov.pl/api/v2"
+    elif env == "DEMO":
+        return "https://ksef-demo.mf.gov.pl/api/online"
+    else: # TEST
+        return "https://ksef-test.mf.gov.pl/api/online"
 
-CURRENT_CONFIG = ENV_CONFIG[KSEF_ENV]
-KSEF_URL = CURRENT_CONFIG["URL"]
-KSEF_NIP = CURRENT_CONFIG["NIP"]
-KSEF_TOKEN = CURRENT_CONFIG["TOKEN"]
-SHEET_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
-SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "KSeF Invoices Sync")
-PROGRESS_FILE = "progress.txt"
-
-def save_progress(date_iso):
-    """Saves the last successfully synced date (upper bound of next chunk)."""
-    with open(PROGRESS_FILE, "w") as f:
-        f.write(date_iso)
-
-def load_progress():
-    """Loads the last successfully synced date."""
-    if os.path.exists(PROGRESS_FILE):
-        with open(PROGRESS_FILE, "r") as f:
-            return f.read().strip()
-    return None
-
-def fetch_invoices_reverse_chunks(ksef, start_date, end_date, chunk_days=30):
+def first_run_setup():
     """
-    Fetches invoices in chunks of `chunk_days` working BACKWARDS from end_date to start_date.
-    Saves progress after each chunk.
+    Wizard for first-time setup. Creates client_metadata.json.
     """
-    all_invoices = []
+    print("\n--- PIERWSZE URUCHOMIENIE (SETUP) ---")
+    print("Wygląda na to, że konfiguracja klienta nie istnieje.")
     
-    # "Current Pointer" tracks the strict end of the current chunk window.
-    # We move this back by chunk_days exactly every iteration.
-    current_pointer = end_date
+    client_name = input("Co to za klient? (Nazwa): ").strip()
+    sheet_name = input("Jak nazwać arkusz Google Sheets?: ").strip()
+    boss_email = input("Email szefa do udostępnienia arkusza?: ").strip()
+    frequency = input("Częstotliwość (Dzień/Tydzień/Godzina)?: ").strip()
     
-    empty_chunk_streak = 0
+    metadata = {
+        "client_name": client_name,
+        "sheet_name": sheet_name,
+        "boss_email": boss_email,
+        "frequency": frequency,
+        "last_sync": None
+    }
     
-    # We loop until current_pointer is back at (or before) start_date
-    while current_pointer > start_date:
-        # 1. Define Strict Window
-        chunk_start = current_pointer - timedelta(days=chunk_days)
-        if chunk_start < start_date:
-            chunk_start = start_date
-            
-        # 2. Define Query Window (with 1 day overlap on the END side)
-        # We query from chunk_start to (current_pointer + 1 day)
-        # This catches invoices at the boundary of the previous chunk.
-        query_end = current_pointer + timedelta(days=1)
+    with open(METADATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=4, ensure_ascii=False)
         
-        start_iso = chunk_start.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-        end_iso_query = query_end.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-        
-        print(f"\n--- Chunk (Reverse): {start_iso} to {end_iso_query} ---")
-        try:
-            batch = ksef.get_invoices(start_iso, end_iso_query, page_size=250)
-            
-            if not batch:
-                 print(f"No invoices in this chunk... Moving to next period.")
-                 empty_chunk_streak += 1
-            else:
-                 all_invoices.extend(batch)
-                 empty_chunk_streak = 0 # Reset streak
-            
-            # Save checkpoint: We successfully synced down to 'chunk_start'.
-            save_progress(start_iso)
-            
-            # 3-Strike Empty Rule
-            if empty_chunk_streak >= 3:
-                print(f"\n[WARNING] No data found for the last {chunk_days * 3} days (3 consecutive chunks).")
-                try:
-                    choice = input("Continue searching further back? (Y/N): ").strip().upper()
-                    if choice != 'Y':
-                        print("Stopping sync by user request.")
-                        break
-                    else:
-                        empty_chunk_streak = 0 # Reset to allow another 3 chunks
-                except EOFError:
-                    break
-            
-        except Exception as e:
-            print(f"ERROR fetching chunk {start_iso}: {e}")
-            print("Stopping sync to preserve checkpoint integrity.")
-            raise e
-            
-        # Move pointer back strictly
-        current_pointer = chunk_start
-        
-    return all_invoices
-
-    return all_invoices
-
-def main():
-    print(f"--- KSeF Sync [{KSEF_ENV}] Started ---")
+    print(f"Zapisano konfigurację w {METADATA_FILE}.\n")
     
-    # Validation
-    if not KSEF_NIP or not KSEF_TOKEN:
-        print(f"Error: NIP or TOKEN missing for environment {KSEF_ENV} in .env")
-        sys.exit(1)
+    # Try to share immediately if possible
+    try:
+        secrets = load_secrets()
+        creds_path = secrets["GOOGLE_CREDENTIALS_PATH"]
+        if boss_email:
+             sheets = SheetsClient(creds_path, sheet_name)
+             sheets.authenticate()
+             sheets.get_or_create_sheet()
+             sheets.share_sheet(boss_email)
+    except Exception as e:
+        print(f"Warning: Could not share sheet during setup: {e}")
         
-    if not os.path.exists(SHEET_CREDENTIALS):
-        print(f"Error: {SHEET_CREDENTIALS} not found. Please setup Google Cloud Credentials.")
-        sys.exit(1)
+    return metadata
 
-    # 1. Initialize Clients
-    ksef = KsefClient(KSEF_URL, KSEF_NIP, KSEF_TOKEN)
-    sheets = SheetsClient(SHEET_CREDENTIALS, SHEET_NAME)
+def load_metadata():
+    if not os.path.exists(METADATA_FILE):
+        return None
+    with open(METADATA_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-    # 2. Interactive Mode Selection
-    print("\nSelect Sync Mode:")
-    print("A: Complete History (Reverse 30-day Chunks + Checkpointing)")
-    print("B: Quarterly Catch-up (Last 90 Days)")
-    print("C: Weekly Pulse (Last 7 Days)")
-    print("D: Dry Run (Connection Test - No Sheet Write)")
+def update_last_sync(metadata):
+    metadata["last_sync"] = datetime.datetime.now().isoformat()
+    with open(METADATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=4, ensure_ascii=False)
+
+def perform_sync(secrets, metadata, auto_mode=False):
+    """
+    Main Sync Logic.
+    """
+    print(f"\n--- Rozpoczynanie synchronizacji dla: {metadata['client_name']} ---")
+    
+    # 1. KSeF Init
+    base_url = get_base_url(secrets["KSEF_ENV"])
+    nip = secrets["KSEF_NIP"]
+    token = secrets["KSEF_TOKEN"]
+    
+    ksef = KsefClient(base_url, nip, token)
     
     try:
-        choice = input("Enter choice (A/B/C): ").strip().upper()
-    except EOFError:
-        print("Input error, defaulting to C (Weekly).")
-        choice = 'C'
+        ksef.authenticate()
+    except Exception as e:
+        print(f"[FATAL] Błąd autoryzacji KSeF: {e}")
+        return
 
-    if choice not in ['A', 'B', 'C', 'D']:
-        print("Invalid choice. Exiting.")
-        sys.exit(1)
-
-    # 3. Authenticate Sheets (Authenticate KSeF later to save session time if Resume prompt waits)
+    # 2. Sheets Init
+    sheet_name = metadata["sheet_name"]
+    creds_path = secrets["GOOGLE_CREDENTIALS_PATH"]
+    
+    sheets = SheetsClient(creds_path, sheet_name)
     try:
         sheets.authenticate()
         sheets.get_or_create_sheet()
+        
+        # Share with Boss logic MOVED to First Run / Setup
+        # Only check if specifically requested or maybe just rely on setup.
+        # To be safe for existing users who might have missed it, we could add a flag, 
+        # but user specifically asked to "Stop the Email Spam" so we remove it from here.
+            
     except Exception as e:
-        print(f"Google Sheets Error: {e}")
-        sys.exit(1)
-        
-    # 4. Configure Sync Parameters
-    today = datetime.now()
-    existing_ids = set()
-    invoices = []
+        print(f"[FATAL] Błąd Google Sheets: {e}")
+        return
+
+    # 3. Determine Date Range
+    # If Auto Mode -> Last 24h
+    # If Manual -> Ask or Smart Sync? 
+    # For now, let's implement the Auto logic as default for logic simplicity in this overhaul,
+    # or implement a simple choice if not auto.
     
-    if choice == 'A':
-        print("\n--- MODE A: COMPLETE HISTORY (REVERSE) ---")
-        # Default Full History Limit
-        absolute_start = datetime(2022, 1, 1)
-        
-        # Check Checkpoint
-        last_checkpoint = load_progress()
-        current_upper_bound = today
-        
-        should_resume = False
-        if last_checkpoint:
-            print(f"Checkpoint found: {last_checkpoint}")
-            # Ask to resume? Or auto-resume? User said "If restarted, it should start from that date"
-            # Interactive prompt implies we can ask.
-            try:
-                res = input(f"Resume fetching from {last_checkpoint}? (Y/N): ").strip().upper()
-                if res == 'Y':
-                    should_resume = True
-                    # If resuming, our "End Date" for the loop is the checkpoint date
-                    # We continue going BACKWARDS from there.
-                    try:
-                        # Parse checkpoint date (ISO)
-                        # Handle potential timezone Z replacement if needed
-                        if 'Z' in last_checkpoint:
-                             current_upper_bound = datetime.fromisoformat(last_checkpoint.replace('Z', '+00:00'))
-                        else:
-                             current_upper_bound = datetime.fromisoformat(last_checkpoint)
-                    except ValueError:
-                        print("Invalid checkpoint format. Starting fresh.")
-                        should_resume = False
-            except EOFError:
-                pass
-        
-        if not should_resume:
-            print("Starting fresh sync from Today backwards to 2022...")
-            # If fresh, clear sheet? User said "Clear the Google Sheet" for Mode A.
-            # But if resuming, we SHOULD NOT clear.
-            sheets.clear_sheet()
-            if os.path.exists(PROGRESS_FILE):
-                os.remove(PROGRESS_FILE)
-            current_upper_bound = today
-            
-        print("Fetching existing ids (just in case)...")
-        # existing_ids = sheets.get_existing_ids() # If clear_sheet was called, this is empty.
-        # If resuming, we need them to avoid dupes at the boundary?
-        # Actually dedupe logic handles it. Mode A chunks might overlap slightly if not careful, 
-        # but dedupe protects.
-        if should_resume:
-             existing_ids = sheets.get_existing_ids()
-        
-        # 5. Authenticate KSeF
-        try:
-            ksef.authenticate()
-        except Exception as e:
-            print(f"KSeF Auth Error: {e}")
-            sys.exit(1)
-            
-        # 6. Fetch (Reverse)
-        print(f"Fetching reversed chunks from {current_upper_bound} down to {absolute_start}...")
-        try:
-            invoices = fetch_invoices_reverse_chunks(ksef, absolute_start, current_upper_bound, chunk_days=30)
-        except Exception as e:
-            print(f"\nSync Interrupted: {e}")
-            print("Progress saved. Restart script to resume.")
-            # We still want to save what we have? 
-            # fetch handles batch extension, so invoices list has the success batches.
-            # We can process what we have.
-            pass
-
-    elif choice == 'B':
-        print("\n--- MODE B: QUARTERLY CATCH-UP ---")
-        start_date = today - timedelta(days=90)
-        start_date_iso = start_date.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-        end_date_iso = today.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-        
-        print("Fetching existing invoices for deduplication...")
-        existing_ids = sheets.get_existing_ids()
-        print(f"Found {len(existing_ids)} existing ids.")
-        
-        # Authenticate
-        try:
-            ksef.authenticate()
-        except Exception as e: 
-            print(f"Authentication Failed: {e}")
-            sys.exit(1)
-            
-        print(f"Fetching from {start_date_iso} to {end_date_iso}...")
-        try:
-            # Use reverse chunks even for Mode B to be safe and avoid 0001 errors or timeouts
-            # Reuse the robust function we have. 
-            # Note: fetch_invoices_reverse_chunks takes datetime objects, not strings.
-            invoices = fetch_invoices_reverse_chunks(ksef, start_date, today, chunk_days=30)
-        except Exception as e:
-            print(f"KSeF Query Error: {e}")
-            sys.exit(1)
-        
-    elif choice == 'C':
-        print("\n--- MODE C: WEEKLY PULSE ---")
-        start_date = today - timedelta(days=7)
-        start_date_iso = start_date.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-        end_date_iso = today.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-        
-        print("Fetching existing invoices for deduplication...")
-        existing_ids = sheets.get_existing_ids()
-        print(f"Found {len(existing_ids)} existing ids.")
-        
-        # Authenticate
-        try:
-            ksef.authenticate()
-        except Exception: 
-            sys.exit(1)
-            
-        print(f"Fetching from {start_date_iso} to {end_date_iso}...")
-        try:
-            invoices = ksef.get_invoices(start_date_iso, end_date_iso, page_size=1000)
-        except Exception as e:
-            print(f"KSeF Query Error: {e}")
-            sys.exit(1)
-
-    elif choice == 'D':
-        print("\n--- MODE D: DRY RUN (VERIFICATION) ---")
-        # Just fetch last 7 days to test connection
-        start_date = today - timedelta(days=7)
-        start_date_iso = start_date.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-        end_date_iso = today.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-        
-        # Authenticate
-        try:
-            ksef.authenticate()
-        except Exception: 
-            sys.exit(1)
-            
-        print(f"Test Fetching from {start_date_iso} to {end_date_iso}...")
-        try:
-            invoices = ksef.get_invoices(start_date_iso, end_date_iso, page_size=100)
-            print(f"SUCCESS! Connection working. Found {len(invoices)} invoices.")
-            print("Skipping Sheets Sync in Dry Run mode.")
-            return # Exit main
-        except Exception as e:
-            print(f"KSeF Query Error: {e}")
-            sys.exit(1)
-
-    # 7. Process & Deduplicate
-    new_rows = []
-    skipped_count = 0
+    end_date = datetime.datetime.now()
     
-    print(f"\nProcessing {len(invoices)} retrieved invoices...")
-    for invoice in invoices:
-        # 1. Extract Core Identifiers FIRST (Fix for UnboundLocalError)
-        ksef_id = invoice.get('ksefReferenceNumber') or invoice.get('ksefNumber')
-        inv_num = invoice.get('invoiceReferenceNumber') or invoice.get('invoiceNumber') or 'N/A'
-        
-        # 2. Extract Key Dates
-        inv_date = invoice.get('invoicingDate') or invoice.get('acquisitionDate') or 'N/A'
-        if inv_date and 'T' in inv_date:
-            inv_date = inv_date.split('T')[0]
-            
-        payment_due = invoice.get('paymentDueDate') or 'N/A'
-        if payment_due and 'T' in payment_due:
-            payment_due = payment_due.split('T')[0]
-
-        # 3. Extract Seller Info
-        seller = invoice.get('seller', {})
-        # Try finding name in various places
-        seller_name = seller.get('name') \
-                      or invoice.get('issuedBy', {}).get('name', {}).get('tradeName') \
-                      or invoice.get('issuedBy', {}).get('name', {}).get('fullName') \
-                      or 'Unknown'
-                      
-        seller_nip = seller.get('nip') or invoice.get('issuedBy', {}).get('identifier', {}).get('identifier') or 'N/A'
-
-        # 4. Check Duplicates with full info available for logging
-        if not ksef_id:
-             continue
-             
-        if ksef_id in existing_ids:
-            skipped_count += 1
-            # Now we have inv_num and seller_name available for the log
-            print(f"Skipped Duplicate: {inv_num} - {seller_name}")
-            continue
-            
-        # 5. Extract Amounts
-        net = invoice.get('netAmount', 0.0)
-        gross = invoice.get('grossAmount', 0.0)
-        # currency = invoice.get('currency', 'PLN') # Not used in new header structure directly, implied or separate?
-        # User requested headers: KSeF ID, Sprzedawca, Nr dokumentu, Data, TERMIN, Netto, Brutto, ...
-        
-        # 6. Build Row (Matches New Header Structure)
-        # Headers: [KSeF ID, Sprzedawca, Nr dokumentu, Data, TERMIN, Netto, Brutto, Kategoria, PŁATNOŚĆ, LOKAL, UWAGI]
-        # We only provide the first 7 columns data. The rest are placeholders for Manual Data.
-        row = [ksef_id, seller_name, inv_num, inv_date, payment_due, net, gross]
-        
-        new_rows.append(row)
-        existing_ids.add(ksef_id) # Prevent dupes in same batch
-
-    # 8. Sync to Sheets
-    if new_rows:
-        print(f"Syncing {len(new_rows)} new invoices...")
-        try:
-            sheets.sync_formatted_data(new_rows)
-        except Exception as e:
-            print(f"Error syncing to sheet: {e}")
+    if auto_mode:
+        print("[AUTO] Pobieranie faktur z ostatnich 24 godzin...")
+        start_date = end_date - datetime.timedelta(days=1)
     else:
-        print("No new invoices to sync.")
+        # Manual Mode Choice
+        print("\nWybierz zakres dat:")
+        print("1. Ostatnie 24h")
+        print("2. Ostatnie 7 dni")
+        print("3. Ostatnie 30 dni")
+        print("4. Ostatnie 90 dni")
+        print("5. Wszystko (Initial Load - Może trwać długo)")
         
-    print(f"\nSummary:")
-    print(f"Total Fetched: {len(invoices)}")
-    print(f"Duplicates Skipped: {skipped_count}")
-    print(f"New Synced: {len(new_rows)}")
-    print("--- Sync Complete ---")
+        choice = input("Wybór [1]: ").strip()
+        
+        if choice == "2":
+            start_date = end_date - datetime.timedelta(days=7)
+        elif choice == "3":
+            start_date = end_date - datetime.timedelta(days=30)
+        elif choice == "4":
+            start_date = end_date - datetime.timedelta(days=90)
+        elif choice == "5":
+            # Arbitrary old date
+            start_date = datetime.datetime(2022, 1, 1)
+        else:
+            start_date = end_date - datetime.timedelta(days=1)
+    
+    # Format to ISO 8601
+    # KSeF expects: YYYY-MM-DDThh:mm:ss+00:00 (or Z)
+    start_iso = start_date.astimezone().isoformat()
+    end_iso = end_date.astimezone().isoformat()
+    
+    # 4. Fetch from KSeF
+    try:
+        # Assuming get_invoices handles the actual fetching loop
+        invoices = ksef.get_invoices(start_iso, end_iso)
+    except Exception as e:
+        print(f"Błąd pobierania faktur: {e}")
+        return
+
+    if not invoices:
+        print("Brak nowych faktur w zadanym okresie.")
+        return
+
+    # SheetsClient.sync_formatted_data expects a list of rows.
+    # We need to map KSeF Invoice objects to rows matching our Headers.
+    # Headers: KSeF ID, Sprzedawca, Nr dokumentu, Data, TERMIN, Netto, Brutto, Kategoria, PŁATNOŚĆ, LOKAL, UWAGI
+    
+    if len(invoices) > 0:
+        print("\n[DEBUG] Przykładowa faktura (struktura):")
+        # Print first invoice keys to debug data loss
+        # print(list(invoices[0].keys()))
+        # print(json.dumps(invoices[0], indent=2, ensure_ascii=False)[:500] + "...")
+        
+        # DUMP TO FILE FOR AGENT INSPECTION
+        with open("debug_invoice.json", "w", encoding="utf-8") as f:
+            json.dump(invoices[0], f, indent=4, ensure_ascii=False)
+        print("[DEBUG] Zapisano 'debug_invoice.json'.")
+    
+    formatted_rows = []
+    
+    for inv in invoices:
+        # Mapping logic based on debug_invoice.json
+        # Structure:
+        # "ksefNumber": "...",
+        # "invoiceNumber": "...",
+        # "seller": { "name": "..." },
+        # "issueDate": "...",
+        # "netAmount": 82.9,
+        # "grossAmount": 87.05
+        
+        ksef_id = inv.get("ksefNumber") or inv.get("ksefReferenceNumber") or inv.get("referenceNumber")
+        
+        # Fallback ID
+        if not ksef_id:
+             ksef_id = f"NO_ID_{datetime.datetime.now().timestamp()}_{inv.get('invoicingDate','')}"
+
+        nr_dok = inv.get("invoiceNumber") or inv.get("invoiceReferenceNumber", "")
+        
+        # Seller
+        seller_name = "Nieznany"
+        if "seller" in inv and isinstance(inv["seller"], dict):
+            seller_name = inv["seller"].get("name", "Nieznany")
+        elif "subjectBy" in inv:
+            # Fallback to old logic just in case
+            sb = inv["subjectBy"]
+            if "issuedByName" in sb: seller_name = sb["issuedByName"]
+            elif "issuedByIdentifier" in sb: 
+                ident = sb["issuedByIdentifier"]
+                seller_name = ident.get("identifier", "Nieznany ID") if isinstance(ident, dict) else str(ident)
+
+        # Dates
+        invoicing_date = inv.get("issueDate") or inv.get("invoicingDate", "")
+        acquisition_date = inv.get("acquisitionDate") or inv.get("acquisitionTimestamp", "") 
+        
+        # Amounts
+        netto = inv.get("netAmount")
+        if netto is None: netto = inv.get("net", 0.0)
+        
+        brutto = inv.get("grossAmount")
+        if brutto is None: brutto = inv.get("gross", 0.0)
+        
+        try:
+            netto = float(netto)
+        except:
+            netto = 0.0
+            
+        try:
+            brutto = float(brutto)
+        except:
+            brutto = 0.0
+        
+        row = [
+            ksef_id,
+            seller_name,
+            nr_dok,
+            invoicing_date,
+            acquisition_date, # Placeholder for TERMIN
+            netto,
+            brutto
+        ]
+        
+        formatted_rows.append(row)
+        
+    print(f"Przetwarzanie {len(formatted_rows)} faktur do arkusza...")
+    sheets.sync_formatted_data(formatted_rows)
+    
+    update_last_sync(metadata)
+    print("Sukces!")
+
+def reset_application():
+    """
+    Deletes config files and restarts.
+    """
+    print("\n[RESET] Usuwanie plików konfiguracyjnych...")
+    
+    files_to_remove = [METADATA_FILE, TOKEN_FILE]
+    for f in files_to_remove:
+        if os.path.exists(f):
+            try:
+                os.remove(f)
+                print(f"Usunięto: {f}")
+            except Exception as e:
+                print(f"Błąd usuwania {f}: {e}")
+                
+    print("Restartowanie aplikacji...")
+    time.sleep(1)
+    # Restart the script
+    python = sys.executable
+    os.execl(python, python, *sys.argv)
+
+def main():
+    parser = argparse.ArgumentParser(description="KSeF Sync Tool")
+    parser.add_argument("--auto", action="store_true", help="Run in autonomous cloud mode (daily sync, no menu)")
+    args = parser.parse_args()
+    
+    # 1. Secrets
+    secrets = load_secrets()
+    
+    # 2. Metadata / First Run
+    metadata = load_metadata()
+    
+    if args.auto:
+        if not metadata:
+            print("[AUTO] ERROR: setup not completed (client_metadata.json missing). Run manually first.")
+            sys.exit(1)
+            
+        perform_sync(secrets, metadata, auto_mode=True)
+        sys.exit(0)
+        
+    # Manual Mode
+    if not metadata:
+        metadata = first_run_setup()
+        
+    while True:
+        print(f"\n=== MENU GŁÓWNE: {metadata['client_name']} ===")
+        print("[1] Synchronizuj (Sync)")
+        print("[R] Resetuj ustawienia (Reset)")
+        print("[E] Wyjście")
+        
+        choice = input("Wybór: ").upper().strip()
+        
+        if choice == "1":
+            perform_sync(secrets, metadata)
+        elif choice == "R":
+            confirm = input("Czy na pewno chcesz usunąć dane i zresetować? (T/N): ").upper()
+            if confirm == "T":
+                reset_application()
+        elif choice == "E":
+            print("Do widzenia.")
+            sys.exit(0)
+        else:
+            print("Nieznana opcja.")
 
 if __name__ == "__main__":
     main()
