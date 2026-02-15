@@ -6,3 +6,7 @@ google-auth-httplib2
 google-api-python-client
 gspread
 cryptography
+flask
+gunicorn
+google-cloud-secret-manager
+google-cloud-firestore

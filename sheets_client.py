@@ -3,9 +3,8 @@ import datetime
 from collections import defaultdict
 import gspread
 from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google.auth.exceptions import RefreshError
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google.oauth2 import service_account
+from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build # Added for Drive API
 
 # If modifying these scopes, delete the file token.json.
@@ -15,9 +14,16 @@ SCOPES = [
 ]
 
 class SheetsClient:
-    def __init__(self, credentials_path, sheet_name):
-        self.credentials_path = credentials_path
+    def __init__(self, service_account_info, sheet_name, spreadsheet_id=None):
+        """
+        service_account_info: Dict containing the parsed JSON key for the Service Account.
+        sheet_name: Name of the spreadsheet.
+        spreadsheet_id: Optional ID of an existing spreadsheet.
+        """
+        self.service_account_info = service_account_info
         self.sheet_name = sheet_name
+        self.spreadsheet_id = spreadsheet_id
+        print(f"DEBUG: SheetsClient initialized with spreadsheet_id='{self.spreadsheet_id}'")
         self.creds = None
         self.client = None
         self.spreadsheet = None 
@@ -29,48 +35,16 @@ class SheetsClient:
         }
 
     def authenticate(self):
-        """Authenticates with Google and creates a gspread client."""
-        # Check existing token
-        if os.path.exists("token.json"):
-            try:
-                self.creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-            except Exception:
-                print("Corrupted token.json found. Deleting...")
-                os.remove("token.json")
-                self.creds = None
-        
-        # If valid credentials exist, try to use/refresh them
-        if self.creds and self.creds.expired and self.creds.refresh_token:
-            try:
-                self.creds.refresh(Request())
-            except RefreshError:
-                print("Token expired and refresh failed (invalid_grant). Deleting token.json to re-authenticate...")
-                if os.path.exists("token.json"):
-                    os.remove("token.json")
-                self.creds = None
-            except Exception as e:
-                print(f"Error refreshing token: {e}. Deleting token.json...")
-                if os.path.exists("token.json"):
-                    os.remove("token.json")
-                self.creds = None
-
-        # If no valid creds (either didn't exist, expired & failed refresh, or deleted), do full login
-        if not self.creds or not self.creds.valid:
-            if not os.path.exists(self.credentials_path):
-                raise FileNotFoundError(f"Missing {self.credentials_path}.")
-            
-            flow = InstalledAppFlow.from_client_secrets_file(
-                self.credentials_path, SCOPES
+        """Authenticates using Service Account Credentials."""
+        try:
+            self.creds = Credentials.from_service_account_info(
+                self.service_account_info, scopes=SCOPES
             )
-            # FORCE offline access to get a refresh_token
-            # FORCE consent prompt to ensure we get a refresh_token even if user previously approved
-            self.creds = flow.run_local_server(port=8080, access_type='offline', prompt='consent')
-            
-            with open("token.json", "w") as token:
-                token.write(self.creds.to_json())
-
-        self.client = gspread.authorize(self.creds)
-        print("Authenticated with Google Sheets.")
+            self.client = gspread.authorize(self.creds)
+            print("Authenticated with Google Sheets (Service Account).")
+        except Exception as e:
+            print(f"Authentication Error: {e}")
+            raise
 
     def share_sheet(self, email):
         """Shares the spreadsheet with the specified email using Drive API."""
@@ -101,12 +75,28 @@ class SheetsClient:
             print(f"Error sharing sheet: {e}")
 
     def get_or_create_sheet(self):
-        """Opens the sheet or creates it."""
+        """Opens the sheet by ID (preferred) or name, or creates it."""
         try:
+            if self.spreadsheet_id:
+                print(f"Attempting to open sheet by ID: {self.spreadsheet_id}")
+                self.spreadsheet = self.client.open_by_key(self.spreadsheet_id)
+                self.sheet = self.spreadsheet.sheet1
+                print(f"Opened existing sheet by ID: {self.spreadsheet_id}")
+                return
+
             self.spreadsheet = self.client.open(self.sheet_name)
             self.sheet = self.spreadsheet.sheet1
             print(f"Opened existing sheet: {self.sheet_name}")
         except gspread.exceptions.SpreadsheetNotFound:
+            if self.spreadsheet_id:
+                # If ID was provided but not found/accessible, we should probably fail hard 
+                # to avoid creating duplicate sheets if that was the intent.
+                # But for now, let's print a warning and maybe error out?
+                # User requested: "If it fails to open by ID, print a clear message"
+                error_msg = f"Spreadsheet ID {self.spreadsheet_id} missing or access denied. Please share the sheet with the Service Account."
+                print(error_msg)
+                raise Exception(error_msg)
+            
             print(f"Sheet '{self.sheet_name}' not found. Creating...")
             self.spreadsheet = self.client.create(self.sheet_name)
             self.sheet = self.spreadsheet.sheet1
