@@ -237,7 +237,9 @@ def perform_sync(secrets, metadata, auto_mode=False):
 
         # Dates
         invoicing_date = inv.get("issueDate") or inv.get("invoicingDate", "")
-        acquisition_date = inv.get("acquisitionDate") or inv.get("acquisitionTimestamp", "") 
+        if invoicing_date:
+            invoicing_date = invoicing_date[:10]
+        acquisition_date = ""  # Force empty TERMIN 
         
         # Amounts
         netto = inv.get("netAmount")

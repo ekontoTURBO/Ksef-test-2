@@ -344,9 +344,15 @@ class SheetsClient:
         self.sheet.clear()
         
         try:
-             self.sheet.update("A1", output_rows)
+             # Try modern gspread (v6+) signature or robust kwarg
+             self.sheet.update(range_name="A1", values=output_rows, value_input_option="USER_ENTERED")
         except Exception:
-             self.sheet.update(range_name="A1", values=output_rows)
+             # Fallback for older gspread or if keyword arg issues
+             try:
+                 self.sheet.update("A1", output_rows, value_input_option="USER_ENTERED")
+             except Exception as e:
+                 print(f"Warning: Could not use USER_ENTERED: {e}")
+                 self.sheet.update("A1", output_rows)
              
         # Generate Batch Updates
         requests = []
@@ -411,6 +417,16 @@ class SheetsClient:
         })
         
         # Column Formatting
+        # Data (D/3) -> Date Format (yyyy-mm-dd)
+        requests.append({
+            "repeatCell": {
+                "range": {"sheetId": self.sheet.id, "startColumnIndex": 3, "endColumnIndex": 4},
+                "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "yyyy-mm-dd"}}},
+                "fields": "userEnteredFormat(numberFormat)"
+            }
+        })
+        
+        # Netto (F/5), Brutto (G/6) -> Currency
         # Netto (F/5), Brutto (G/6) -> Currency
         # Columns 5 and 6.
         requests.append({
